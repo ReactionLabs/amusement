@@ -41,7 +41,13 @@ from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 
 BASE = Path(__file__).resolve().parent
-DB_PATH = BASE / "arena.db"
+# Vercel's runtime filesystem is read-only except /tmp. Without DATABASE_URL
+# (not yet configured) fall back to an ephemeral SQLite db in /tmp so the
+# function can at least boot; real persistence needs Postgres via DATABASE_URL.
+if os.environ.get("VERCEL") and not os.environ.get("DATABASE_URL"):
+    DB_PATH = Path("/tmp/arena.db")
+else:
+    DB_PATH = BASE / "arena.db"
 
 # ---------- database backend ----------
 # Local dev (no DATABASE_URL): SQLite file, background scheduler thread.
