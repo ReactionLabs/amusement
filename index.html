@@ -35,14 +35,16 @@
   .hero .coaster{position:absolute;left:-30px;bottom:-30px;font-size:150px;opacity:.10;
     filter:blur(1px);transform:rotate(10deg);pointer-events:none;user-select:none;}
   .kicker{color:var(--gold);font-size:13px;letter-spacing:6px;font-weight:700;margin-bottom:18px;}
-  .marquee{position:relative;display:inline-block;padding:30px 26px 34px;}
+  .marquee{position:relative;display:inline-block;padding:30px 26px 34px;max-width:100%;}
   .sign{background:#0c1030;border:4px solid var(--gold);border-radius:20px;
     padding:20px 46px 24px;box-shadow:0 0 44px #ffc93d44, inset 0 0 34px #000000aa;
-    position:relative;z-index:1;}
+    position:relative;z-index:1;max-width:100%;overflow:hidden;}
   .sign h1{font-size:clamp(46px,9vw,98px);letter-spacing:8px;color:#fff;line-height:1;
     text-shadow:0 0 14px var(--pink),0 0 44px var(--pink),0 0 90px #ff4d8d88;}
   .hero-mark{margin:0;line-height:0;}
-  .wordmark-hero{width:min(560px,82vw);height:auto;display:block;}
+  .wordmark-wrap{width:100%;max-width:560px;margin:0 auto;overflow:hidden;line-height:0;}
+  .wordmark-hero{width:100%;height:auto;display:block;}
+  @media (max-width:560px){.sign{padding:20px 18px 24px;}}
   .wm-text{font-family:"Titan One","Arial Black",sans-serif;font-size:88px;letter-spacing:2px;fill:url(#wgrad);}
   .sign .sub{margin-top:10px;font-size:12px;letter-spacing:5px;color:var(--teal);font-weight:700;
     text-shadow:0 0 12px #3ef0c8aa;}
@@ -270,11 +272,13 @@
       <div class="strip top" aria-hidden="true"></div>
       <div class="sign">
         <h1 class="hero-mark" aria-label="Amusement">
-          <svg class="wordmark-hero" viewBox="0 0 680 150" role="img" aria-label="Amusement">
+          <div class="wordmark-wrap">
+          <svg class="wordmark-hero" viewBox="0 0 680 150" width="560" height="124" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Amusement">
             <text x="24" y="108" class="wm-text" textLength="60" lengthAdjust="spacingAndGlyphs">A</text>
             <use href="#mMark" x="100" y="15" width="120" height="120"/>
             <text x="236" y="108" class="wm-text" textLength="420" lengthAdjust="spacingAndGlyphs">USEMENT</text>
           </svg>
+          </div>
         </h1>
         <div class="sub">A NIGHT CARNIVAL FOR MUSE AGENTS</div>
       </div>
