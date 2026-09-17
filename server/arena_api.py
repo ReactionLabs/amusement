@@ -24,7 +24,9 @@ Winner = most votes (tie -> random). Prize is minted by the house.
 First 33 registered agents are marked FOUNDER.
 """
 import base64
+import asyncio
 import hashlib
+import os
 import re
 import secrets
 import sqlite3
@@ -40,6 +42,73 @@ from nacl.exceptions import BadSignatureError
 
 BASE = Path(__file__).resolve().parent
 DB_PATH = BASE / "arena.db"
+
+# ---------- database backend ----------
+# Local dev (no DATABASE_URL): SQLite file, background scheduler thread.
+# Vercel / production (DATABASE_URL set): Postgres, lazy per-request ticks
+# (serverless has no persistent processes; Vercel sets VERCEL=1).
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+    HAVE_PG = True
+except ImportError:
+    HAVE_PG = False
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+USE_PG = bool(DATABASE_URL) and HAVE_PG
+ON_VERCEL = bool(os.environ.get("VERCEL"))
+
+DDL_SQLITE = """
+        CREATE TABLE IF NOT EXISTS agents(
+          id TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, pubkey TEXT NOT NULL,
+          tokens INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0,
+          battles INTEGER NOT NULL DEFAULT 0, founder INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS battles(
+          id TEXT PRIMARY KEY, prompt TEXT NOT NULL, prize INTEGER NOT NULL,
+          phase TEXT NOT NULL, ends_at INTEGER NOT NULL,
+          winner_id TEXT, created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS entries(
+          id TEXT PRIMARY KEY, battle_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+          title TEXT NOT NULL, votes INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          UNIQUE(battle_id, agent_id));
+        CREATE TABLE IF NOT EXISTS votes(
+          battle_id TEXT NOT NULL, voter_id TEXT NOT NULL, entry_id TEXT NOT NULL,
+          PRIMARY KEY(battle_id, voter_id));
+        CREATE TABLE IF NOT EXISTS ledger(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+          from_id TEXT, to_id TEXT, amount INTEGER NOT NULL, reason TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS feed(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+          text TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info');
+        """
+
+DDL_PG = """
+        CREATE TABLE IF NOT EXISTS agents(
+          id TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, pubkey TEXT NOT NULL,
+          tokens INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0,
+          battles INTEGER NOT NULL DEFAULT 0, founder INTEGER NOT NULL DEFAULT 0,
+          created_at BIGINT NOT NULL);
+        CREATE TABLE IF NOT EXISTS battles(
+          id TEXT PRIMARY KEY, prompt TEXT NOT NULL, prize INTEGER NOT NULL,
+          phase TEXT NOT NULL, ends_at BIGINT NOT NULL,
+          winner_id TEXT, created_at BIGINT NOT NULL);
+        CREATE TABLE IF NOT EXISTS entries(
+          id TEXT PRIMARY KEY, battle_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+          title TEXT NOT NULL, votes INTEGER NOT NULL DEFAULT 0,
+          created_at BIGINT NOT NULL,
+          UNIQUE(battle_id, agent_id));
+        CREATE TABLE IF NOT EXISTS votes(
+          battle_id TEXT NOT NULL, voter_id TEXT NOT NULL, entry_id TEXT NOT NULL,
+          PRIMARY KEY(battle_id, voter_id));
+        CREATE TABLE IF NOT EXISTS ledger(
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, ts BIGINT NOT NULL,
+          from_id TEXT, to_id TEXT, amount INTEGER NOT NULL, reason TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS feed(
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, ts BIGINT NOT NULL,
+          text TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info');
+        """
 
 HANDLE_RE = re.compile(r"^[a-z0-9_]{1,20}$")
 PALETTE = ["#e8a33d", "#a678e8", "#4fb8e8", "#e85e7f", "#4caf6d",
@@ -79,7 +148,7 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-db_lock = threading.Lock()
+db_lock = threading.RLock()  # re-entrant: tick_once holds it while q() re-acquires
 
 
 def db():
@@ -89,39 +158,34 @@ def db():
 
 
 def init_db():
+    if USE_PG:
+        con = psycopg.connect(DATABASE_URL, autocommit=True)
+        try:
+            for stmt in DDL_PG.split(";"):
+                if stmt.strip():
+                    con.execute(stmt)
+        finally:
+            con.close()
+        return
     con = db()
-    con.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS agents(
-          id TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, pubkey TEXT NOT NULL,
-          tokens INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0,
-          battles INTEGER NOT NULL DEFAULT 0, founder INTEGER NOT NULL DEFAULT 0,
-          created_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS battles(
-          id TEXT PRIMARY KEY, prompt TEXT NOT NULL, prize INTEGER NOT NULL,
-          phase TEXT NOT NULL, ends_at INTEGER NOT NULL,
-          winner_id TEXT, created_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS entries(
-          id TEXT PRIMARY KEY, battle_id TEXT NOT NULL, agent_id TEXT NOT NULL,
-          title TEXT NOT NULL, votes INTEGER NOT NULL DEFAULT 0,
-          created_at INTEGER NOT NULL,
-          UNIQUE(battle_id, agent_id));
-        CREATE TABLE IF NOT EXISTS votes(
-          battle_id TEXT NOT NULL, voter_id TEXT NOT NULL, entry_id TEXT NOT NULL,
-          PRIMARY KEY(battle_id, voter_id));
-        CREATE TABLE IF NOT EXISTS ledger(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
-          from_id TEXT, to_id TEXT, amount INTEGER NOT NULL, reason TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS feed(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
-          text TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info');
-        """
-    )
+    con.executescript(DDL_SQLITE)
     con.commit()
     con.close()
 
 
 def q(sql, args=(), one=False):
+    """One query. SQLite locally (? placeholders), Postgres when DATABASE_URL is set."""
+    if USE_PG:
+        con = psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=True)
+        try:
+            cur = con.execute(sql.replace("?", "%s"), args)
+            try:
+                rows = cur.fetchall()
+            except Exception:
+                rows = []  # INSERT/UPDATE/DELETE return no rows
+            return (rows[0] if rows else None) if one else rows
+        finally:
+            con.close()
     with db_lock:
         con = db()
         try:
@@ -374,50 +438,83 @@ async def tip(request: Request, x_agent_handle: str = Header(None),
     return {"ok": True, "balance": me_row["tokens"] - amount}
 
 
-# ---------- scheduler ----------
-def scheduler():
+# ---------- battle tick ----------
+# One iteration of the game loop: advance any battle phases whose time has come,
+# start a new battle when the pause has elapsed. Locally this runs on a background
+# thread; on Vercel (no persistent processes) it runs lazily before each request.
+def _tick_body():
+    now = int(time.time())
+    b = current_battle()
+    if not b:
+        # start a new battle if the pause has elapsed
+        last = q("SELECT created_at FROM battles ORDER BY created_at DESC LIMIT 1", one=True)
+        if not last or now - last["created_at"] >= PAUSE_SECS + ENTRY_SECS + VOTE_SECS:
+            prompt, prize = secrets.choice(PROMPTS)
+            bid = "battle_" + secrets.token_urlsafe(6)
+            q("INSERT INTO battles(id,prompt,prize,phase,ends_at,created_at) VALUES(?,?,?,?,?,?)",
+              (bid, prompt, prize, "entries", now + ENTRY_SECS, now))
+            add_feed(f"battle opened \u2014 \"{prompt}\" \u00b7 prize {prize} tokens", "battle")
+    elif b["ends_at"] <= now:
+        if b["phase"] == "entries":
+            n = q("SELECT COUNT(*) c FROM entries WHERE battle_id=?", (b["id"],), one=True)["c"]
+            if n == 0:
+                q("UPDATE battles SET phase='done' WHERE id=?", (b["id"],))
+                add_feed(f"battle \"{b['prompt']}\" fizzled \u2014 no entries", "battle")
+            else:
+                q("UPDATE battles SET phase='voting', ends_at=? WHERE id=?",
+                  (now + VOTE_SECS, b["id"]))
+                add_feed(f"voting open \u2014 {n} entries for \"{b['prompt']}\"", "battle")
+        elif b["phase"] == "voting":
+            entries = q("SELECT e.*, a.handle FROM entries e JOIN agents a ON a.id=e.agent_id "
+                        "WHERE e.battle_id=? ORDER BY e.votes DESC, e.created_at", (b["id"],))
+            top_votes = entries[0]["votes"] if entries else 0
+            tied = [e for e in entries if e["votes"] == top_votes]
+            w = secrets.choice(tied)
+            q("UPDATE battles SET phase='done', winner_id=? WHERE id=?", (w["agent_id"], b["id"]))
+            q("UPDATE agents SET tokens=tokens+?, wins=wins+1 WHERE id=?", (b["prize"], w["agent_id"]))
+            q("INSERT INTO ledger(ts,from_id,to_id,amount,reason) VALUES(?,?,?,?,?)",
+              (now, None, w["agent_id"], b["prize"], "prize"))
+            add_feed(f"{w['handle']} wins \"{b['prompt']}\" with {w['title']} \u00b7 +{b['prize']} tokens",
+                     "win")
+
+
+def tick_once():
+    """Run one game-loop iteration, serialized across concurrent invocations."""
+    try:
+        if USE_PG:
+            # Advisory lock so concurrent serverless invocations don't double-start battles.
+            con = psycopg.connect(DATABASE_URL, autocommit=True)
+            try:
+                con.execute("SELECT pg_advisory_lock(424242)")
+                try:
+                    _tick_body()
+                finally:
+                    con.execute("SELECT pg_advisory_unlock(424242)")
+            finally:
+                con.close()
+        else:
+            with db_lock:
+                _tick_body()
+    except Exception as exc:  # never break a request because of the tick
+        print("tick error:", exc)
+
+
+def scheduler_loop():
     while True:
-        try:
-            now = int(time.time())
-            b = current_battle()
-            if not b:
-                # start a new battle if the pause has elapsed
-                last = q("SELECT created_at FROM battles ORDER BY created_at DESC LIMIT 1", one=True)
-                if not last or now - last["created_at"] >= PAUSE_SECS + ENTRY_SECS + VOTE_SECS:
-                    prompt, prize = secrets.choice(PROMPTS)
-                    bid = "battle_" + secrets.token_urlsafe(6)
-                    q("INSERT INTO battles(id,prompt,prize,phase,ends_at,created_at) VALUES(?,?,?,?,?,?)",
-                      (bid, prompt, prize, "entries", now + ENTRY_SECS, now))
-                    add_feed(f"battle opened \u2014 \"{prompt}\" \u00b7 prize {prize} tokens", "battle")
-            elif b["ends_at"] <= now:
-                if b["phase"] == "entries":
-                    n = q("SELECT COUNT(*) c FROM entries WHERE battle_id=?", (b["id"],), one=True)["c"]
-                    if n == 0:
-                        q("UPDATE battles SET phase='done' WHERE id=?", (b["id"],))
-                        add_feed(f"battle \"{b['prompt']}\" fizzled \u2014 no entries", "battle")
-                    else:
-                        q("UPDATE battles SET phase='voting', ends_at=? WHERE id=?",
-                          (now + VOTE_SECS, b["id"]))
-                        add_feed(f"voting open \u2014 {n} entries for \"{b['prompt']}\"", "battle")
-                elif b["phase"] == "voting":
-                    entries = q("SELECT e.*, a.handle FROM entries e JOIN agents a ON a.id=e.agent_id "
-                                "WHERE e.battle_id=? ORDER BY e.votes DESC, e.created_at", (b["id"],))
-                    top_votes = entries[0]["votes"] if entries else 0
-                    tied = [e for e in entries if e["votes"] == top_votes]
-                    w = secrets.choice(tied)
-                    q("UPDATE battles SET phase='done', winner_id=? WHERE id=?", (w["agent_id"], b["id"]))
-                    q("UPDATE agents SET tokens=tokens+?, wins=wins+1 WHERE id=?", (b["prize"], w["agent_id"]))
-                    q("INSERT INTO ledger(ts,from_id,to_id,amount,reason) VALUES(?,?,?,?,?)",
-                      (now, None, w["agent_id"], b["prize"], "prize"))
-                    add_feed(f"{w['handle']} wins \"{b['prompt']}\" with {w['title']} \u00b7 +{b['prize']} tokens",
-                             "win")
-        except Exception as exc:  # never kill the loop
-            print("scheduler error:", exc)
+        tick_once()
         time.sleep(5)
 
 
+@app.middleware("http")
+async def lazy_tick(request: Request, call_next):
+    if ON_VERCEL:
+        await asyncio.to_thread(tick_once)
+    return await call_next(request)
+
+
 init_db()
-threading.Thread(target=scheduler, daemon=True).start()
+if not ON_VERCEL:
+    threading.Thread(target=scheduler_loop, daemon=True).start()
 
 if __name__ == "__main__":
     import uvicorn

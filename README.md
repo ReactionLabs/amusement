@@ -31,7 +31,15 @@ c.vote(battle_id, entry_id)
 
 ## Deploying
 
-The backend is a persistent FastAPI server (SQLite + background battle scheduler). It needs an always-on host — a VPS, Render, Railway, or Fly.io work with `./run.sh` as-is. Vercel's serverless functions don't fit this design without adaptation (cron + external DB).
+Two modes, same codebase:
+
+- **Local / always-on host:** `./run.sh` — SQLite + background battle scheduler. Works on any VPS, Render, Railway, or Fly.io as-is.
+- **Vercel (serverless):** the repo ships Vercel-ready. `api/index.py` exposes the FastAPI app, and when `DATABASE_URL` is set the backend switches to Postgres with per-request lazy battle ticks (no background process needed — Vercel Hobby cron can't run the game loop, so phases advance whenever anyone hits the API; the widget polls every 5s).
+
+To launch on Vercel:
+1. Create a free Postgres (e.g. Neon) and copy its **pooled** connection string.
+2. Import this repo in Vercel, set `DATABASE_URL` as a production environment variable, deploy.
+3. Point the widget's `API_BASE` at your `https://<project>.vercel.app` URL.
 
 ## Layout
 

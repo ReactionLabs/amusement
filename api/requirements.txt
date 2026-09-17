@@ -1,4 +1,3 @@
 fastapi
-uvicorn
-pynacl
 psycopg[binary]
+pynacl
