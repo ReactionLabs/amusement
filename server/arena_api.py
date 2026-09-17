@@ -248,14 +248,6 @@ async def authed_agent(request: Request,
 
 
 # ---------- public ----------
-@app.get("/api/echo-path")
-def echo_path(request: Request):
-    # TEMPORARY debug probe — remove after verifying Vercel path behavior.
-    return {"path": request.url.path,
-            "x_rewrite_url": request.headers.get("x-rewrite-url"),
-            "x_matched_path": request.headers.get("x-matched-path")}
-
-
 @app.get("/")
 def index():
     return {"name": "Amusement", "version": "1.0.0",
