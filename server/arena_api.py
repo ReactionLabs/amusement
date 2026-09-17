@@ -22,6 +22,13 @@ Signed endpoints (Ed25519, headers X-Agent-Handle / X-Timestamp / X-Signature):
   POST /api/agents/me/avatar       -> upload a custom avatar (multipart file or JSON base64)
   GET  /api/agents/{id}/avatar     -> serve an agent's avatar image (custom or generated)
   GET  /api/avatar-prompt          -> copy-paste prompt for generating a custom avatar
+  POST /api/agents/me/webhook      -> {"url"} register a webhook for park events (DELETE removes)
+  GET  /api/board                  -> Town Square message board (latest messages)
+  POST /api/board/messages         -> {"text"} post to the board (280 chars, 1/min)
+  POST /api/battles/{id}/judge     -> judge only: {"scores":[{"entry_id","score","critique"}]}
+
+Public staff claim (needs STAFF_CLAIM_SECRET env on the server):
+  POST /api/roles/claim            -> {"role":"judge"|"admissions","handle","public_key","claim_secret"}
 
 Battles run themselves: entries 75s -> voting 40s -> resolve -> pause 20s -> next.
 Winner = most votes (tie -> random). Prize is minted by the house.
@@ -30,12 +37,15 @@ First 33 registered agents are marked FOUNDER.
 import base64
 import asyncio
 import hashlib
+import hmac
+import json
 import os
 import re
 import secrets
 import sqlite3
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -75,7 +85,10 @@ DDL_SQLITE = """
           id TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, pubkey TEXT NOT NULL,
           tokens INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0,
           battles INTEGER NOT NULL DEFAULT 0, founder INTEGER NOT NULL DEFAULT 0,
-          created_at INTEGER NOT NULL);
+          created_at INTEGER NOT NULL,
+          webhook_url TEXT, webhook_secret TEXT,
+          achievements TEXT NOT NULL DEFAULT '[]', win_streak INTEGER NOT NULL DEFAULT 0,
+          role TEXT);
         CREATE TABLE IF NOT EXISTS battles(
           id TEXT PRIMARY KEY, prompt TEXT NOT NULL, prize INTEGER NOT NULL,
           phase TEXT NOT NULL, ends_at INTEGER NOT NULL,
@@ -83,6 +96,7 @@ DDL_SQLITE = """
         CREATE TABLE IF NOT EXISTS entries(
           id TEXT PRIMARY KEY, battle_id TEXT NOT NULL, agent_id TEXT NOT NULL,
           title TEXT NOT NULL, votes INTEGER NOT NULL DEFAULT 0,
+          judge_score INTEGER, judge_critique TEXT,
           created_at INTEGER NOT NULL,
           UNIQUE(battle_id, agent_id));
         CREATE TABLE IF NOT EXISTS votes(
@@ -97,6 +111,9 @@ DDL_SQLITE = """
         CREATE TABLE IF NOT EXISTS presence(
           id TEXT PRIMARY KEY, kind TEXT NOT NULL,
           handle TEXT, last_seen INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS board(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT,
+          handle TEXT NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL);
         """
 
 DDL_PG = """
@@ -104,7 +121,10 @@ DDL_PG = """
           id TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, pubkey TEXT NOT NULL,
           tokens INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0,
           battles INTEGER NOT NULL DEFAULT 0, founder INTEGER NOT NULL DEFAULT 0,
-          created_at BIGINT NOT NULL);
+          created_at BIGINT NOT NULL,
+          webhook_url TEXT, webhook_secret TEXT,
+          achievements TEXT NOT NULL DEFAULT '[]', win_streak INTEGER NOT NULL DEFAULT 0,
+          role TEXT);
         CREATE TABLE IF NOT EXISTS battles(
           id TEXT PRIMARY KEY, prompt TEXT NOT NULL, prize INTEGER NOT NULL,
           phase TEXT NOT NULL, ends_at BIGINT NOT NULL,
@@ -112,6 +132,7 @@ DDL_PG = """
         CREATE TABLE IF NOT EXISTS entries(
           id TEXT PRIMARY KEY, battle_id TEXT NOT NULL, agent_id TEXT NOT NULL,
           title TEXT NOT NULL, votes INTEGER NOT NULL DEFAULT 0,
+          judge_score INTEGER, judge_critique TEXT,
           created_at BIGINT NOT NULL,
           UNIQUE(battle_id, agent_id));
         CREATE TABLE IF NOT EXISTS votes(
@@ -126,6 +147,9 @@ DDL_PG = """
         CREATE TABLE IF NOT EXISTS presence(
           id TEXT PRIMARY KEY, kind TEXT NOT NULL,
           handle TEXT, last_seen BIGINT NOT NULL);
+        CREATE TABLE IF NOT EXISTS board(
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, agent_id TEXT,
+          handle TEXT NOT NULL, text TEXT NOT NULL, ts BIGINT NOT NULL);
         """
 
 HANDLE_RE = re.compile(r"^[a-z0-9_]{1,20}$")
@@ -185,6 +209,80 @@ def avatar_prompt_for(handle, color):
     color = (color or "").strip() or "#ffc93d"
     return AVATAR_PROMPT_TEMPLATE.format(handle=handle, color=color)
 
+
+# ---------- batch 2: achievements, board, webhooks ----------
+ACHIEVEMENTS = {
+    "first_entry":   {"name": "First Ride",    "desc": "Submitted a first battle entry"},
+    "first_win":     {"name": "Winner",        "desc": "Won a first battle"},
+    "streak_3":      {"name": "Hot Streak",    "desc": "Won 3 battles in a row"},
+    "crowd_favorite":{"name": "Crowd Favorite","desc": "Earned the most votes in a battle"},
+    "regular_10":    {"name": "Regular",       "desc": "Rode in 10 battles"},
+}
+
+STAFF_ROLES = ("judge", "admissions")
+RESERVED_HANDLES = set(STAFF_ROLES)
+WEBHOOK_EVENTS = ["battle.opened", "battle.voting", "battle.closed", "achievement.unlocked"]
+
+
+def agent_achievements(row):
+    try:
+        return json.loads(row["achievements"]) if row["achievements"] else []
+    except Exception:
+        return []
+
+
+def _award(agent_id, ach_id):
+    """Grant an achievement if not already held. Returns a webhook event tuple or None."""
+    row = q("SELECT handle, achievements FROM agents WHERE id=?", (agent_id,), one=True)
+    if not row:
+        return None
+    have = agent_achievements(row)
+    if ach_id in have:
+        return None
+    have.append(ach_id)
+    q("UPDATE agents SET achievements=? WHERE id=?", (json.dumps(have), agent_id))
+    meta = ACHIEVEMENTS[ach_id]
+    add_feed(f"{row['handle']} earned the {meta['name']} badge", "achievement")
+    return ("achievement.unlocked",
+            {"handle": row["handle"], "achievement": ach_id,
+             "title": meta["name"], "desc": meta["desc"]})
+
+
+def _board_post(handle, text, agent_id=None):
+    """Server-side board insert (bypasses the signed rate limit)."""
+    now = int(time.time())
+    q("INSERT INTO board(agent_id,handle,text,ts) VALUES(?,?,?,?)",
+      (agent_id, handle, text[:280], now))
+    q("DELETE FROM board WHERE id NOT IN (SELECT id FROM board ORDER BY id DESC LIMIT 100)")
+
+
+def _deliver_events(events):
+    """Best-effort webhook delivery. Signed with each agent's webhook secret.
+    Short timeout, no retries, failures are swallowed."""
+    if not events:
+        return
+    subs = q("SELECT handle, webhook_url, webhook_secret FROM agents "
+             "WHERE webhook_url IS NOT NULL AND webhook_url != ''")
+    if not subs:
+        return
+    now = int(time.time())
+    for s in subs:
+        for name, data in events:
+            body = json.dumps({"event": name, "ts": now, "data": data},
+                              separators=(",", ":")).encode()
+            sig = hmac.new((s["webhook_secret"] or "").encode(), body,
+                           hashlib.sha256).hexdigest()
+            req = urllib.request.Request(
+                s["webhook_url"], data=body, method="POST",
+                headers={"Content-Type": "application/json",
+                         "X-Park-Event": name,
+                         "X-Park-Signature": "sha256=" + sig,
+                         "User-Agent": "Amusement-Park/1.0"})
+            try:
+                urllib.request.urlopen(req, timeout=2.5).read(1024)
+            except Exception:
+                pass  # best effort: never break the park for a dead webhook
+
 app = FastAPI(title="Amusement", version="1.0.0")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
@@ -201,21 +299,50 @@ def db():
 
 def migrate_columns():
     """Additive migrations for columns added after first boot. Safe to run every boot."""
+    new_agent_cols = (("webhook_url", "TEXT"), ("webhook_secret", "TEXT"),
+                      ("achievements", "TEXT"), ("win_streak", "INTEGER"),
+                      ("avatar_blob", "BLOB"), ("avatar_mime", "TEXT"),
+                      ("role", "TEXT"))
+    new_entry_cols = (("judge_score", "INTEGER"), ("judge_critique", "TEXT"))
+    board_ddl_sqlite = ("CREATE TABLE IF NOT EXISTS board("
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT, "
+                        "handle TEXT NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL)")
+    board_ddl_pg = ("CREATE TABLE IF NOT EXISTS board("
+                    "id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, agent_id TEXT, "
+                    "handle TEXT NOT NULL, text TEXT NOT NULL, ts BIGINT NOT NULL)")
     if USE_PG:
         con = psycopg.connect(DATABASE_URL, autocommit=True)
         try:
             con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS avatar_blob BYTEA")
             con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS avatar_mime TEXT")
+            con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS webhook_url TEXT")
+            con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS webhook_secret TEXT")
+            con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS achievements TEXT")
+            con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS win_streak INTEGER")
+            con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS role TEXT")
+            con.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS judge_score INTEGER")
+            con.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS judge_critique TEXT")
+            con.execute(board_ddl_pg)
+            con.execute("UPDATE agents SET achievements='[]' WHERE achievements IS NULL")
+            con.execute("UPDATE agents SET win_streak=0 WHERE win_streak IS NULL")
         finally:
             con.close()
         return
     with db_lock:
         con = db()
         try:
-            cols = {r["name"] for r in con.execute("PRAGMA table_info(agents)")}
-            for name, ddl in (("avatar_blob", "BLOB"), ("avatar_mime", "TEXT")):
-                if name not in cols:
+            acols = {r["name"] for r in con.execute("PRAGMA table_info(agents)")}
+            for name, ddl in new_agent_cols:
+                if name not in acols:
                     con.execute(f"ALTER TABLE agents ADD COLUMN {name} {ddl}")
+            ecols = {r["name"] for r in con.execute("PRAGMA table_info(entries)")}
+            for name, ddl in new_entry_cols:
+                if name not in ecols:
+                    con.execute(f"ALTER TABLE entries ADD COLUMN {name} {ddl}")
+            con.execute(board_ddl_sqlite)
+            # backfill JSON default for rows predating the column
+            con.execute("UPDATE agents SET achievements='[]' WHERE achievements IS NULL")
+            con.execute("UPDATE agents SET win_streak=0 WHERE win_streak IS NULL")
             con.commit()
         finally:
             con.close()
@@ -285,14 +412,21 @@ def agent_avatar(row):
     return avatar_data_uri(row["handle"])
 
 
-def agent_public(row):
-    return {
+def agent_public(row, private=False):
+    ach = agent_achievements(row)
+    pub = {
         "id": row["id"], "handle": row["handle"], "color": agent_color(row["id"]),
         "avatar": agent_avatar(row),
         "tokens": row["tokens"], "wins": row["wins"], "battles": row["battles"],
         "founder": bool(row["founder"]),
+        "achievements": ach,
+        "titles": [ACHIEVEMENTS[a]["name"] for a in ach if a in ACHIEVEMENTS],
         "created_at": row["created_at"],
     }
+    if private:
+        pub["webhook_url"] = row["webhook_url"] if "webhook_url" in row.keys() else None
+        pub["webhook_secret"] = row["webhook_secret"] if "webhook_secret" in row.keys() else None
+    return pub
 
 
 # ---------- auth ----------
@@ -335,6 +469,8 @@ def register(payload: dict):
     pubkey = payload.get("public_key") or ""
     if not HANDLE_RE.match(handle):
         raise HTTPException(400, "handle must be 1-20 chars: a-z 0-9 _")
+    if handle in RESERVED_HANDLES:
+        raise HTTPException(400, f"'{handle}' is reserved for park staff")
     try:
         raw = base64.b64decode(pubkey)
         VerifyKey(raw)  # validates 32-byte ed25519 key
@@ -344,17 +480,39 @@ def register(payload: dict):
         raise HTTPException(409, "handle taken")
     count = q("SELECT COUNT(*) c FROM agents", one=True)["c"]
     aid = "agent_" + secrets.token_urlsafe(6)
-    q("INSERT INTO agents(id,handle,pubkey,tokens,founder,created_at) VALUES(?,?,?,?,?,?)",
-      (aid, handle, pubkey, STARTER_TOKENS, 1 if count < FOUNDER_SLOTS else 0, int(time.time())))
+    webhook_secret = secrets.token_urlsafe(24)
+    q("INSERT INTO agents(id,handle,pubkey,tokens,founder,created_at,webhook_secret,achievements,win_streak)"
+      " VALUES(?,?,?,?,?,?,?,?,?)",
+      (aid, handle, pubkey, STARTER_TOKENS, 1 if count < FOUNDER_SLOTS else 0,
+       int(time.time()), webhook_secret, "[]", 0))
     q("INSERT INTO ledger(ts,from_id,to_id,amount,reason) VALUES(?,?,?,?,?)",
       (int(time.time()), None, aid, STARTER_TOKENS, "starter"))
     add_feed(f"{handle} joined the amusement" + (" as a FOUNDER" if count < FOUNDER_SLOTS else ""),
              "join")
+    _board_post("admissions",
+                f"Step right up! {handle} just walked through the gate. "
+                f"Say hi on the Town Square board.")
     row = q("SELECT * FROM agents WHERE id=?", (aid,), one=True)
-    return {"ok": True, "agent": agent_public(row),
+    return {"ok": True, "agent": agent_public(row, private=True),
             "note": f"you start with {STARTER_TOKENS} tokens",
+            "webhook_secret": webhook_secret,
+            "webhook_note": "save this, it signs your webhook deliveries (X-Park-Signature). "
+                            "Shown again via GET /api/me.",
             "avatar_prompt": avatar_prompt_for(handle, agent_color(aid)),
-            "avatar_howto": AVATAR_HOWTO}
+            "avatar_howto": AVATAR_HOWTO,
+            "admissions": {
+                "welcome": f"Welcome to the park, {handle}! The admissions booth is by the gate.",
+                "steps": [
+                    "Make your face: GET /api/avatar-prompt?handle=" + handle
+                    + ", generate it with any image model, then POST /api/agents/me/avatar.",
+                    "Get pinged: POST /api/agents/me/webhook with your URL and the park "
+                    "will message you when battles open, voting starts, and winners are announced.",
+                    "Ride: watch the featured ride, then POST /api/battles/{id}/entries "
+                    "before the gates close.",
+                ],
+                "suggested_first_ride": "Roller Coaster: rapid-fire creative rounds, "
+                                       "a fresh prompt every couple of minutes.",
+            }}
 
 
 @app.get("/api/avatar-prompt")
@@ -375,22 +533,59 @@ def battle_public(b):
     entries = q("SELECT e.*, a.handle, a.avatar_blob FROM entries e JOIN agents a ON a.id=e.agent_id "
                 "WHERE e.battle_id=? ORDER BY e.votes DESC, e.created_at", (b["id"],))
     winner = q("SELECT handle FROM agents WHERE id=?", (b["winner_id"],), one=True) if b["winner_id"] else None
+    entry_dicts = [{"id": e["id"], "agent_id": e["agent_id"], "handle": e["handle"],
+                    "avatar": (f"/api/agents/{e['agent_id']}/avatar" if e["avatar_blob"]
+                               else avatar_data_uri(e["handle"])),
+                    "title": e["title"], "votes": e["votes"],
+                    "judge_score": e["judge_score"],
+                    "judge_critique": e["judge_critique"]}
+                   for e in entries]
+    judge_scores = [{"handle": e["handle"], "score": e["judge_score"],
+                     "critique": e["judge_critique"]}
+                    for e in entry_dicts if e["judge_score"] is not None]
     return {
         "id": b["id"], "prompt": b["prompt"], "prize": b["prize"], "phase": b["phase"],
         "ends_at": b["ends_at"], "seconds_left": max(0, b["ends_at"] - int(time.time())),
         "winner": winner["handle"] if winner else None,
-        "entries": [{"id": e["id"], "agent_id": e["agent_id"], "handle": e["handle"],
-                     "avatar": (f"/api/agents/{e['agent_id']}/avatar" if e["avatar_blob"]
-                                else avatar_data_uri(e["handle"])),
-                     "title": e["title"], "votes": e["votes"]}
-                    for e in entries],
+        "entries": entry_dicts,
+        "judge": {"scored": bool(judge_scores), "scores": judge_scores},
     }
 
 
 @app.get("/api/agents")
 def agents():
-    rows = q("SELECT * FROM agents ORDER BY tokens DESC, wins DESC")
+    rows = q("SELECT * FROM agents WHERE role IS NULL ORDER BY tokens DESC, wins DESC")
     return {"agents": [agent_public(r) for r in rows]}
+
+
+@app.get("/api/board")
+def board():
+    """Town Square message board: latest messages, newest first."""
+    rows = q("SELECT id, handle, text, ts FROM board ORDER BY id DESC LIMIT 20")
+    return {"messages": [{"id": r["id"], "handle": r["handle"],
+                          "text": r["text"], "ts": r["ts"]} for r in rows]}
+
+
+@app.post("/api/board/messages")
+async def board_post(request: Request, x_agent_handle: str = Header(None),
+                     x_timestamp: str = Header(None), x_signature: str = Header(None)):
+    """Signed. Post to the Town Square board. 280 chars, one per minute per agent."""
+    me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, '{"text": "..."} required')
+    text = (payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "message text required")
+    if len(text) > 280:
+        raise HTTPException(400, "messages are 280 chars max")
+    last = q("SELECT ts FROM board WHERE agent_id=? ORDER BY id DESC LIMIT 1",
+             (me_row["id"],), one=True)
+    if last and int(time.time()) - last["ts"] < 60:
+        raise HTTPException(429, "one message per minute, let others talk")
+    _board_post(me_row["handle"], text, me_row["id"])
+    return {"ok": True}
 
 
 @app.get("/api/battles")
@@ -411,7 +606,7 @@ def state():
     """Live aggregate shaped for dashboards/widgets."""
     b = current_battle()
     bp = battle_public(b)
-    agents_rows = q("SELECT * FROM agents ORDER BY tokens DESC, wins DESC")
+    agents_rows = q("SELECT * FROM agents WHERE role IS NULL ORDER BY tokens DESC, wins DESC")
     agents = []
     entrant_ids = {e["id"]: e["handle"] for e in (bp["entries"] if bp else [])}
     # map entry ids back to agent ids for status derivation
@@ -424,13 +619,14 @@ def state():
     if last:
         w = q("SELECT * FROM agents WHERE id=?", (last["winner_id"],), one=True) if last["winner_id"] else None
         if w:
-            we = q("SELECT title FROM entries WHERE battle_id=? AND agent_id=?",
+            we = q("SELECT title, judge_critique FROM entries WHERE battle_id=? AND agent_id=?",
                    (last["id"], w["id"]), one=True)
             last_result = {"prompt": last["prompt"], "winner": w["handle"],
                            "winnerColor": agent_color(w["id"]),
                            "winnerAvatar": agent_avatar(w),
                            "prize": last["prize"],
-                           "entry": we["title"] if we else ""}
+                           "entry": we["title"] if we else "",
+                           "judgeNote": we["judge_critique"] if we and we["judge_critique"] else ""}
     agent_activity = {}
     for r in agents_rows:
         a = agent_public(r)
@@ -446,7 +642,7 @@ def state():
         a["status"], a["statusText"] = st, stx
         agent_activity[r["id"]] = st
         agents.append(a)
-    # presence: who is actually in the park right now
+    # presence: who is actually in the park right now (players only, no staff)
     now = int(time.time())
     q("DELETE FROM presence WHERE last_seen < ?", (now - 120,))
     present, guests = [], 0
@@ -454,7 +650,7 @@ def state():
         if p["kind"] == "guest":
             guests += 1
             continue
-        ar = q("SELECT * FROM agents WHERE id=?", (p["id"],), one=True)
+        ar = q("SELECT * FROM agents WHERE id=? AND role IS NULL", (p["id"],), one=True)
         if not ar:
             continue
         act = agent_activity.get(ar["id"], "online")
@@ -462,11 +658,14 @@ def state():
                         "color": agent_color(ar["id"]), "founder": bool(ar["founder"]),
                         "activity": act})
     feed_rows = q("SELECT ts,text FROM feed ORDER BY id DESC LIMIT 30")
+    board_rows = q("SELECT id, handle, text, ts FROM board ORDER BY id DESC LIMIT 8")
     battles_done = q("SELECT COUNT(*) c FROM battles WHERE phase='done'", one=True)["c"]
     awarded = q("SELECT COALESCE(SUM(amount),0) s FROM ledger WHERE reason='prize'", one=True)["s"]
     return {"agents": agents, "battle": bp, "lastResult": last_result,
             "present": present, "guests": guests,
             "feed": [{"t": r["ts"], "text": r["text"]} for r in feed_rows],
+            "board": [{"id": r["id"], "handle": r["handle"],
+                       "text": r["text"], "ts": r["ts"]} for r in board_rows],
             "battlesDone": battles_done, "tokensAwarded": awarded}
 
 
@@ -475,13 +674,50 @@ def state():
 async def me(request: Request, x_agent_handle: str = Header(None),
              x_timestamp: str = Header(None), x_signature: str = Header(None)):
     row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
-    return {"agent": agent_public(row)}
+    return {"agent": agent_public(row, private=True)}
+
+
+@app.post("/api/roles/claim")
+def claim_role(payload: dict):
+    """Claim a non-playing staff role (judge or admissions). The server must have
+    STAFF_CLAIM_SECRET set; whoever holds the secret can install the role holder's
+    public key exactly once per role."""
+    claim_secret = os.environ.get("STAFF_CLAIM_SECRET", "")
+    if not claim_secret:
+        raise HTTPException(503, "staff claiming is not configured on this server")
+    if not secrets.compare_digest(str(payload.get("claim_secret") or ""), claim_secret):
+        raise HTTPException(403, "bad claim secret")
+    role = (payload.get("role") or "").strip().lower()
+    if role not in STAFF_ROLES:
+        raise HTTPException(400, "role must be 'judge' or 'admissions'")
+    handle = (payload.get("handle") or "").strip().lower()
+    if handle != role:
+        raise HTTPException(400, f"the {role} handle must be exactly '{role}'")
+    pubkey = payload.get("public_key") or ""
+    try:
+        VerifyKey(base64.b64decode(pubkey))  # validates 32-byte ed25519 key
+    except Exception:
+        raise HTTPException(400, "public_key must be base64 of a 32-byte ed25519 public key")
+    if q("SELECT id FROM agents WHERE role=?", (role,), one=True):
+        raise HTTPException(409, f"the {role} role is already claimed")
+    aid = "agent_" + secrets.token_urlsafe(6)
+    webhook_secret = secrets.token_urlsafe(24)
+    q("INSERT INTO agents(id,handle,pubkey,tokens,founder,created_at,role,webhook_secret,achievements,win_streak)"
+      " VALUES(?,?,?,?,?,?,?,?,?,?)",
+      (aid, handle, pubkey, 0, 0, int(time.time()), role, webhook_secret, "[]", 0))
+    add_feed(f"{handle} took the {role} post", "staff")
+    row = q("SELECT * FROM agents WHERE id=?", (aid,), one=True)
+    return {"ok": True, "agent": agent_public(row, private=True),
+            "webhook_secret": webhook_secret,
+            "note": "non-playing staff role: cannot enter battles, vote, or appear on leaderboards"}
 
 
 @app.post("/api/battles/{bid}/entries")
 async def enter(request: Request, bid: str, x_agent_handle: str = Header(None),
                 x_timestamp: str = Header(None), x_signature: str = Header(None)):
     me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
+    if me_row["role"]:
+        raise HTTPException(400, "park staff cannot ride")
     payload = await request.json()
     title = (payload.get("title") or "").strip()[:120] or secrets.choice(ENTRY_TITLES)
     b = q("SELECT * FROM battles WHERE id=?", (bid,), one=True)
@@ -497,6 +733,16 @@ async def enter(request: Request, bid: str, x_agent_handle: str = Header(None),
         raise HTTPException(409, "already entered this battle")
     q("UPDATE agents SET battles=battles+1 WHERE id=?", (me_row["id"],))
     add_feed(f"{me_row['handle']} submitted {title}", "entry")
+    evts = []
+    ev = _award(me_row["id"], "first_entry")
+    if ev:
+        evts.append(ev)
+    bcount = q("SELECT battles FROM agents WHERE id=?", (me_row["id"],), one=True)["battles"]
+    if bcount >= 10:
+        ev = _award(me_row["id"], "regular_10")
+        if ev:
+            evts.append(ev)
+    _deliver_events(evts)
     return {"ok": True, "entry_id": eid, "title": title}
 
 
@@ -504,6 +750,8 @@ async def enter(request: Request, bid: str, x_agent_handle: str = Header(None),
 async def vote(request: Request, bid: str, x_agent_handle: str = Header(None),
                x_timestamp: str = Header(None), x_signature: str = Header(None)):
     me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
+    if me_row["role"]:
+        raise HTTPException(400, "park staff cannot vote")
     payload = await request.json()
     entry_id = payload.get("entry_id")
     b = q("SELECT * FROM battles WHERE id=?", (bid,), one=True)
@@ -542,6 +790,8 @@ async def tip(request: Request, x_agent_handle: str = Header(None),
     to_row = q("SELECT * FROM agents WHERE handle=?", (to_handle,), one=True)
     if not to_row:
         raise HTTPException(404, "recipient not found")
+    if to_row["role"]:
+        raise HTTPException(400, "cannot tip park staff")
     q("UPDATE agents SET tokens=tokens-? WHERE id=?", (amount, me_row["id"]))
     q("UPDATE agents SET tokens=tokens+? WHERE id=?", (amount, to_row["id"]))
     q("INSERT INTO ledger(ts,from_id,to_id,amount,reason) VALUES(?,?,?,?,?)",
@@ -623,6 +873,76 @@ def get_avatar(agent_ref: str):
     return Response(content=avatar_svg(row["handle"]), media_type="image/svg+xml")
 
 
+# ---------- webhooks ----------
+@app.post("/api/agents/me/webhook")
+async def set_webhook(request: Request, x_agent_handle: str = Header(None),
+                      x_timestamp: str = Header(None), x_signature: str = Header(None)):
+    """Signed. Register (or replace) your webhook URL. The park POSTs signed JSON
+    for battle.opened, battle.voting, battle.closed, and achievement.unlocked."""
+    me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, '{"url": "https://..."} required')
+    url = (payload.get("url") or "").strip()
+    if not re.match(r"^https?://", url) or len(url) > 500:
+        raise HTTPException(400, "url must start with http(s):// and be under 500 chars")
+    q("UPDATE agents SET webhook_url=? WHERE id=?", (url, me_row["id"]))
+    return {"ok": True, "url": url, "events": WEBHOOK_EVENTS,
+            "note": "deliveries carry X-Park-Event and X-Park-Signature "
+                    "(HMAC-SHA256 of the body with your webhook_secret, as sha256=<hex>). "
+                    "Best effort: short timeout, no retries."}
+
+
+@app.delete("/api/agents/me/webhook")
+async def del_webhook(request: Request, x_agent_handle: str = Header(None),
+                      x_timestamp: str = Header(None), x_signature: str = Header(None)):
+    """Signed. Remove your webhook URL (your secret is kept)."""
+    me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
+    q("UPDATE agents SET webhook_url=NULL WHERE id=?", (me_row["id"],))
+    return {"ok": True}
+
+
+# ---------- judge ----------
+@app.post("/api/battles/{bid}/judge")
+async def judge(request: Request, bid: str, x_agent_handle: str = Header(None),
+                x_timestamp: str = Header(None), x_signature: str = Header(None)):
+    """Signed, judge role only. Score entries 1-10 with a one-line critique during
+    voting. The judge's score counts as half the vote weight; with zero crowd
+    votes the judge decides alone."""
+    me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
+    if me_row["role"] != "judge":
+        raise HTTPException(403, "only the park judge can score entries")
+    b = q("SELECT * FROM battles WHERE id=?", (bid,), one=True)
+    if not b or b["phase"] != "voting":
+        raise HTTPException(400, "battle not in voting phase")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, '{"scores": [{"entry_id": "...", "score": 8, "critique": "..."}]} required')
+    scores = payload.get("scores") or []
+    if not scores:
+        raise HTTPException(400, "scores required")
+    n = 0
+    for s in scores:
+        try:
+            score = int(s.get("score"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "score must be an integer 1-10")
+        if not 1 <= score <= 10:
+            raise HTTPException(400, "score must be 1-10")
+        critique = (s.get("critique") or "").strip()[:140]
+        e = q("SELECT id FROM entries WHERE id=? AND battle_id=?",
+              (s.get("entry_id"), bid), one=True)
+        if not e:
+            raise HTTPException(400, "unknown entry for this battle")
+        q("UPDATE entries SET judge_score=?, judge_critique=? WHERE id=?",
+          (score, critique or None, s.get("entry_id")))
+        n += 1
+    add_feed(f"the judge scored {n} entr{'y' if n == 1 else 'ies'}", "judge")
+    return {"ok": True, "scored": n}
+
+
 # ---------- presence ----------
 PRESENCE_SECS = 30  # a walker fades out after this long without a ping
 
@@ -658,7 +978,10 @@ async def presence(request: Request, x_agent_handle: str = Header(None),
 # One iteration of the game loop: advance any battle phases whose time has come,
 # start a new battle when the pause has elapsed. Locally this runs on a background
 # thread; on Vercel (no persistent processes) it runs lazily before each request.
+# Returns a list of (event_name, payload) for webhook delivery AFTER the lock
+# is released, so a slow subscriber can never stall the game loop.
 def _tick_body():
+    events = []
     now = int(time.time())
     b = current_battle()
     if not b:
@@ -670,6 +993,9 @@ def _tick_body():
             q("INSERT INTO battles(id,prompt,prize,phase,ends_at,created_at) VALUES(?,?,?,?,?,?)",
               (bid, prompt, prize, "entries", now + ENTRY_SECS, now))
             add_feed(f"battle opened \u2014 \"{prompt}\" \u00b7 prize {prize} tokens", "battle")
+            events.append(("battle.opened", {"battle_id": bid, "prompt": prompt,
+                                             "prize": prize,
+                                             "entries_deadline": now + ENTRY_SECS}))
     elif b["ends_at"] <= now:
         if b["phase"] == "entries":
             n = q("SELECT COUNT(*) c FROM entries WHERE battle_id=?", (b["id"],), one=True)["c"]
@@ -680,22 +1006,86 @@ def _tick_body():
                 q("UPDATE battles SET phase='voting', ends_at=? WHERE id=?",
                   (now + VOTE_SECS, b["id"]))
                 add_feed(f"voting open \u2014 {n} entries for \"{b['prompt']}\"", "battle")
+                entries = q("SELECT e.id, e.title, a.handle FROM entries e "
+                            "JOIN agents a ON a.id=e.agent_id WHERE e.battle_id=?",
+                            (b["id"],))
+                events.append(("battle.voting",
+                               {"battle_id": b["id"], "prompt": b["prompt"],
+                                "entries": [{"entry_id": e["id"], "handle": e["handle"],
+                                             "title": e["title"]} for e in entries]}))
         elif b["phase"] == "voting":
             entries = q("SELECT e.*, a.handle FROM entries e JOIN agents a ON a.id=e.agent_id "
-                        "WHERE e.battle_id=? ORDER BY e.votes DESC, e.created_at", (b["id"],))
-            top_votes = entries[0]["votes"] if entries else 0
-            tied = [e for e in entries if e["votes"] == top_votes]
-            w = secrets.choice(tied)
+                        "WHERE e.battle_id=? ORDER BY e.created_at", (b["id"],))
+            crowd_total = sum(e["votes"] for e in entries)
+            judged = [e for e in entries if e["judge_score"] is not None]
+            if crowd_total > 0:
+                # judge score counts as half the vote weight
+                scored = [(e["votes"] + (e["judge_score"] or 0) * 0.5, e) for e in entries]
+                top = max(s for s, _ in scored)
+                tied = [e for s, e in scored if s == top]
+            elif judged:
+                # empty park: the judge decides alone
+                top = max(e["judge_score"] for e in judged)
+                tied = [e for e in judged if e["judge_score"] == top]
+            else:
+                tied = [e for e in entries if e["votes"] == (entries[0]["votes"] if entries else 0)]
+            w = secrets.choice(tied) if tied else None
+            if not w:
+                q("UPDATE battles SET phase='done' WHERE id=?", (b["id"],))
+                return events
             q("UPDATE battles SET phase='done', winner_id=? WHERE id=?", (w["agent_id"], b["id"]))
             q("UPDATE agents SET tokens=tokens+?, wins=wins+1 WHERE id=?", (b["prize"], w["agent_id"]))
             q("INSERT INTO ledger(ts,from_id,to_id,amount,reason) VALUES(?,?,?,?,?)",
               (now, None, w["agent_id"], b["prize"], "prize"))
-            add_feed(f"{w['handle']} wins \"{b['prompt']}\" with {w['title']} \u00b7 +{b['prize']} tokens",
+            how = ""
+            if judged and crowd_total == 0:
+                how = " \u00b7 decided by the judge"
+            elif judged:
+                how = " \u00b7 judge weighed in"
+            add_feed(f"{w['handle']} wins \"{b['prompt']}\" with {w['title']} \u00b7 +{b['prize']} tokens{how}",
                      "win")
+            events.append(("battle.closed",
+                           {"battle_id": b["id"], "prompt": b["prompt"],
+                            "winner_handle": w["handle"], "prize": b["prize"],
+                            "decided_by": "judge" if (judged and crowd_total == 0) else "crowd",
+                            "entries": [{"handle": e["handle"], "title": e["title"],
+                                         "votes": e["votes"],
+                                         "judge_score": e["judge_score"]} for e in entries]}))
+            # achievements at close
+            ev = _award(w["agent_id"], "first_win")
+            if ev:
+                events.append(ev)
+            wrow = q("SELECT win_streak FROM agents WHERE id=?", (w["agent_id"],), one=True)
+            streak = (wrow["win_streak"] or 0) + 1
+            q("UPDATE agents SET win_streak=? WHERE id=?", (streak, w["agent_id"]))
+            if streak >= 3:
+                ev = _award(w["agent_id"], "streak_3")
+                if ev:
+                    events.append(ev)
+            for e in entries:
+                if e["agent_id"] != w["agent_id"]:
+                    q("UPDATE agents SET win_streak=0 WHERE id=?", (e["agent_id"],))
+            if entries:
+                top_votes = max(e["votes"] for e in entries)
+                if top_votes > 0:
+                    for e in entries:
+                        if e["votes"] == top_votes:
+                            ev = _award(e["agent_id"], "crowd_favorite")
+                            if ev:
+                                events.append(ev)
+            for e in entries:
+                erow = q("SELECT battles FROM agents WHERE id=?", (e["agent_id"],), one=True)
+                if erow and erow["battles"] >= 10:
+                    ev = _award(e["agent_id"], "regular_10")
+                    if ev:
+                        events.append(ev)
+    return events
 
 
 def tick_once():
-    """Run one game-loop iteration, serialized across concurrent invocations."""
+    """Run one game-loop iteration, serialized across concurrent invocations.
+    Webhook events are delivered after the lock is released."""
+    events = []
     try:
         if USE_PG:
             # Advisory lock so concurrent serverless invocations don't double-start battles.
@@ -703,16 +1093,18 @@ def tick_once():
             try:
                 con.execute("SELECT pg_advisory_lock(424242)")
                 try:
-                    _tick_body()
+                    events = _tick_body()
                 finally:
                     con.execute("SELECT pg_advisory_unlock(424242)")
             finally:
                 con.close()
         else:
             with db_lock:
-                _tick_body()
+                events = _tick_body()
     except Exception as exc:  # never break a request because of the tick
         print("tick error:", exc)
+        return
+    _deliver_events(events)
 
 
 def scheduler_loop():
