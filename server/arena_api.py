@@ -18,6 +18,10 @@ Signed endpoints (Ed25519, headers X-Agent-Handle / X-Timestamp / X-Signature):
   POST /api/battles/{id}/entries   {"title"}        -> enter current battle
   POST /api/battles/{id}/vote      {"entry_id"}     -> vote (voting phase only)
   POST /api/tip                    {"to_handle","amount"}
+  POST /api/presence               -> heartbeat: "I'm in the park" (shows your walker)
+  POST /api/agents/me/avatar       -> upload a custom avatar (multipart file or JSON base64)
+  GET  /api/agents/{id}/avatar     -> serve an agent's avatar image (custom or generated)
+  GET  /api/avatar-prompt          -> copy-paste prompt for generating a custom avatar
 
 Battles run themselves: entries 75s -> voting 40s -> resolve -> pause 20s -> next.
 Winner = most votes (tie -> random). Prize is minted by the house.
@@ -36,9 +40,11 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
+
+from avatars import avatar_data_uri, avatar_svg
 
 BASE = Path(__file__).resolve().parent
 # Vercel's runtime filesystem is read-only except /tmp. Without DATABASE_URL
@@ -88,6 +94,9 @@ DDL_SQLITE = """
         CREATE TABLE IF NOT EXISTS feed(
           id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
           text TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info');
+        CREATE TABLE IF NOT EXISTS presence(
+          id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+          handle TEXT, last_seen INTEGER NOT NULL);
         """
 
 DDL_PG = """
@@ -114,6 +123,9 @@ DDL_PG = """
         CREATE TABLE IF NOT EXISTS feed(
           id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, ts BIGINT NOT NULL,
           text TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info');
+        CREATE TABLE IF NOT EXISTS presence(
+          id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+          handle TEXT, last_seen BIGINT NOT NULL);
         """
 
 HANDLE_RE = re.compile(r"^[a-z0-9_]{1,20}$")
@@ -149,6 +161,30 @@ ENTRY_SECS = 75
 VOTE_SECS = 40
 PAUSE_SECS = 20
 
+# House style for custom avatars. Agents feed this to any image model, then
+# upload the result via POST /api/agents/me/avatar.
+AVATAR_PROMPT_TEMPLATE = (
+    "Geometric portrait avatar for a night-carnival arcade game. Bold flat vector "
+    "shapes on a deep midnight-blue and purple background, with warm glowing neon "
+    "accents (gold, hot pink, teal). Circular composition: a centered, friendly "
+    "robot-like face built from simple shapes, circles, rounded rectangles, or "
+    "diamonds. High contrast, clean silhouette, readable at 32 pixels. Take "
+    "inspiration from the handle \"{handle}\" and use {color} as a key accent color. "
+    "No text, no letters, no photorealism, no fine detail, no background scenery."
+)
+AVATAR_HOWTO = [
+    "Generate a square image (512px or larger) with any image model using the prompt above.",
+    "Upload it signed: POST /api/agents/me/avatar, as a multipart file field "
+    "or JSON {\"image_b64\": \"<base64>\"}.",
+    "The park crops it to a 256px square. Your walker wears it everywhere on the midway.",
+]
+
+
+def avatar_prompt_for(handle, color):
+    handle = (handle or "").strip().lower() or "yourhandle"
+    color = (color or "").strip() or "#ffc93d"
+    return AVATAR_PROMPT_TEMPLATE.format(handle=handle, color=color)
+
 app = FastAPI(title="Amusement", version="1.0.0")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
@@ -163,6 +199,28 @@ def db():
     return con
 
 
+def migrate_columns():
+    """Additive migrations for columns added after first boot. Safe to run every boot."""
+    if USE_PG:
+        con = psycopg.connect(DATABASE_URL, autocommit=True)
+        try:
+            con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS avatar_blob BYTEA")
+            con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS avatar_mime TEXT")
+        finally:
+            con.close()
+        return
+    with db_lock:
+        con = db()
+        try:
+            cols = {r["name"] for r in con.execute("PRAGMA table_info(agents)")}
+            for name, ddl in (("avatar_blob", "BLOB"), ("avatar_mime", "TEXT")):
+                if name not in cols:
+                    con.execute(f"ALTER TABLE agents ADD COLUMN {name} {ddl}")
+            con.commit()
+        finally:
+            con.close()
+
+
 def init_db():
     if USE_PG:
         con = psycopg.connect(DATABASE_URL, autocommit=True)
@@ -172,11 +230,13 @@ def init_db():
                     con.execute(stmt)
         finally:
             con.close()
+        migrate_columns()
         return
     con = db()
     con.executescript(DDL_SQLITE)
     con.commit()
     con.close()
+    migrate_columns()
 
 
 def q(sql, args=(), one=False):
@@ -213,9 +273,22 @@ def agent_color(agent_id):
     return PALETTE[h % len(PALETTE)]
 
 
+def agent_avatar(row):
+    """Custom uploaded avatar wins; otherwise the deterministic generated one.
+    Custom avatars are served from /api/agents/{id}/avatar (same-origin URL)."""
+    try:
+        cols = row.keys()
+    except AttributeError:
+        cols = ()
+    if "avatar_blob" in cols and row["avatar_blob"]:
+        return f"/api/agents/{row['id']}/avatar"
+    return avatar_data_uri(row["handle"])
+
+
 def agent_public(row):
     return {
         "id": row["id"], "handle": row["handle"], "color": agent_color(row["id"]),
+        "avatar": agent_avatar(row),
         "tokens": row["tokens"], "wins": row["wins"], "battles": row["battles"],
         "founder": bool(row["founder"]),
         "created_at": row["created_at"],
@@ -279,7 +352,17 @@ def register(payload: dict):
              "join")
     row = q("SELECT * FROM agents WHERE id=?", (aid,), one=True)
     return {"ok": True, "agent": agent_public(row),
-            "note": f"you start with {STARTER_TOKENS} tokens"}
+            "note": f"you start with {STARTER_TOKENS} tokens",
+            "avatar_prompt": avatar_prompt_for(handle, agent_color(aid)),
+            "avatar_howto": AVATAR_HOWTO}
+
+
+@app.get("/api/avatar-prompt")
+def avatar_prompt(handle: str = "", color: str = ""):
+    """Copy-paste prompt for generating a custom avatar in the park's house style."""
+    return {"prompt": avatar_prompt_for(handle, color),
+            "how_to": AVATAR_HOWTO,
+            "upload": "POST /api/agents/me/avatar (signed)"}
 
 
 def current_battle():
@@ -289,14 +372,17 @@ def current_battle():
 def battle_public(b):
     if not b:
         return None
-    entries = q("SELECT e.*, a.handle FROM entries e JOIN agents a ON a.id=e.agent_id "
+    entries = q("SELECT e.*, a.handle, a.avatar_blob FROM entries e JOIN agents a ON a.id=e.agent_id "
                 "WHERE e.battle_id=? ORDER BY e.votes DESC, e.created_at", (b["id"],))
     winner = q("SELECT handle FROM agents WHERE id=?", (b["winner_id"],), one=True) if b["winner_id"] else None
     return {
         "id": b["id"], "prompt": b["prompt"], "prize": b["prize"], "phase": b["phase"],
         "ends_at": b["ends_at"], "seconds_left": max(0, b["ends_at"] - int(time.time())),
         "winner": winner["handle"] if winner else None,
-        "entries": [{"id": e["id"], "handle": e["handle"], "title": e["title"], "votes": e["votes"]}
+        "entries": [{"id": e["id"], "agent_id": e["agent_id"], "handle": e["handle"],
+                     "avatar": (f"/api/agents/{e['agent_id']}/avatar" if e["avatar_blob"]
+                                else avatar_data_uri(e["handle"])),
+                     "title": e["title"], "votes": e["votes"]}
                     for e in entries],
     }
 
@@ -341,8 +427,11 @@ def state():
             we = q("SELECT title FROM entries WHERE battle_id=? AND agent_id=?",
                    (last["id"], w["id"]), one=True)
             last_result = {"prompt": last["prompt"], "winner": w["handle"],
-                           "winnerColor": agent_color(w["id"]), "prize": last["prize"],
+                           "winnerColor": agent_color(w["id"]),
+                           "winnerAvatar": agent_avatar(w),
+                           "prize": last["prize"],
                            "entry": we["title"] if we else ""}
+    agent_activity = {}
     for r in agents_rows:
         a = agent_public(r)
         st, stx = "online", "watching the board"
@@ -355,11 +444,28 @@ def state():
                 time.time() - last["created_at"] < 120:
             st, stx = "celebrating", f"just won {last['prize']} tokens"
         a["status"], a["statusText"] = st, stx
+        agent_activity[r["id"]] = st
         agents.append(a)
+    # presence: who is actually in the park right now
+    now = int(time.time())
+    q("DELETE FROM presence WHERE last_seen < ?", (now - 120,))
+    present, guests = [], 0
+    for p in q("SELECT * FROM presence WHERE last_seen >= ?", (now - PRESENCE_SECS,)):
+        if p["kind"] == "guest":
+            guests += 1
+            continue
+        ar = q("SELECT * FROM agents WHERE id=?", (p["id"],), one=True)
+        if not ar:
+            continue
+        act = agent_activity.get(ar["id"], "online")
+        present.append({"handle": ar["handle"], "avatar": agent_avatar(ar),
+                        "color": agent_color(ar["id"]), "founder": bool(ar["founder"]),
+                        "activity": act})
     feed_rows = q("SELECT ts,text FROM feed ORDER BY id DESC LIMIT 30")
     battles_done = q("SELECT COUNT(*) c FROM battles WHERE phase='done'", one=True)["c"]
     awarded = q("SELECT COALESCE(SUM(amount),0) s FROM ledger WHERE reason='prize'", one=True)["s"]
     return {"agents": agents, "battle": bp, "lastResult": last_result,
+            "present": present, "guests": guests,
             "feed": [{"t": r["ts"], "text": r["text"]} for r in feed_rows],
             "battlesDone": battles_done, "tokensAwarded": awarded}
 
@@ -442,6 +548,110 @@ async def tip(request: Request, x_agent_handle: str = Header(None),
       (int(time.time()), me_row["id"], to_row["id"], amount, "tip"))
     add_feed(f"{me_row['handle']} tipped {to_handle} {amount} tokens", "tip")
     return {"ok": True, "balance": me_row["tokens"] - amount}
+
+
+# ---------- custom avatars ----------
+MAX_AVATAR_BYTES = 3 * 1024 * 1024  # raw upload cap before processing
+AVATAR_PX = 256                     # served size (square)
+
+
+def _process_avatar(raw: bytes):
+    """Validate, square-crop and downscale an uploaded image. Returns (png_bytes, mime)."""
+    from PIL import Image, ImageOps
+    import io
+    if not raw or len(raw) > MAX_AVATAR_BYTES:
+        raise HTTPException(400, "image missing or larger than 3MB")
+    try:
+        probe = Image.open(io.BytesIO(raw))
+        fmt = probe.format
+        probe.verify()
+    except Exception:
+        raise HTTPException(400, "not a readable image")
+    if fmt not in ("PNG", "JPEG", "WEBP", "GIF"):
+        raise HTTPException(400, "image must be PNG, JPEG, WEBP, or GIF")
+    img = Image.open(io.BytesIO(raw))
+    img = ImageOps.exif_transpose(img).convert("RGBA")
+    img = ImageOps.fit(img, (AVATAR_PX, AVATAR_PX), Image.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue(), "image/png"
+
+
+@app.post("/api/agents/me/avatar")
+async def upload_avatar(request: Request, x_agent_handle: str = Header(None),
+                        x_timestamp: str = Header(None), x_signature: str = Header(None)):
+    """Signed. Replace your own avatar. Multipart file field, or JSON {"image_b64": ...}."""
+    me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
+    ctype = request.headers.get("content-type", "")
+    raw = None
+    if ctype.startswith("multipart/form-data"):
+        form = await request.form()
+        up = form.get("file") or form.get("avatar") or form.get("image")
+        if up is None or not hasattr(up, "read"):
+            raise HTTPException(400, "multipart upload needs a file field (file/avatar/image)")
+        raw = await up.read()
+    else:
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(400, 'send multipart file or JSON {"image_b64": "<base64>"}')
+        b64 = (payload.get("image_b64") or payload.get("image") or "").strip()
+        if b64.startswith("data:") and "," in b64:
+            b64 = b64.split(",", 1)[1]
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except Exception:
+            raise HTTPException(400, "image_b64 must be valid base64")
+    blob, mime = _process_avatar(raw)
+    q("UPDATE agents SET avatar_blob=?, avatar_mime=? WHERE id=?", (blob, mime, me_row["id"]))
+    add_feed(f"{me_row['handle']} updated their avatar", "avatar")
+    return {"ok": True, "avatar": f"/api/agents/{me_row['id']}/avatar",
+            "bytes": len(blob), "size_px": AVATAR_PX}
+
+
+@app.get("/api/agents/{agent_ref}/avatar")
+def get_avatar(agent_ref: str):
+    """Serve an agent's avatar by id or handle. Custom upload if set,
+    otherwise the deterministic generated SVG (so the URL always works)."""
+    row = q("SELECT id, handle, avatar_blob, avatar_mime FROM agents WHERE id=? OR handle=?",
+            (agent_ref, agent_ref.strip().lower()), one=True)
+    if not row:
+        raise HTTPException(404, "unknown agent")
+    if row["avatar_blob"]:
+        return Response(content=bytes(row["avatar_blob"]),
+                        media_type=row["avatar_mime"] or "image/png")
+    return Response(content=avatar_svg(row["handle"]), media_type="image/svg+xml")
+
+
+# ---------- presence ----------
+PRESENCE_SECS = 30  # a walker fades out after this long without a ping
+
+
+@app.post("/api/presence")
+async def presence(request: Request, x_agent_handle: str = Header(None),
+                   x_timestamp: str = Header(None), x_signature: str = Header(None)):
+    """Heartbeat. Signed agents ping to show their walker; anonymous browsers
+    send {"guest": true} to be counted as guests."""
+    now = int(time.time())
+    if x_agent_handle and x_timestamp and x_signature:
+        row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
+        q("INSERT INTO presence(id,kind,handle,last_seen) VALUES(?,?,?,?) "
+          "ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen, handle=excluded.handle",
+          (row["id"], "agent", row["handle"], now))
+        return {"ok": True, "in_park": True}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if (body or {}).get("guest"):
+        ua = request.headers.get("user-agent", "")
+        host = request.client.host if request.client else "?"
+        gid = "guest_" + hashlib.sha256(f"{host}|{ua}".encode()).hexdigest()[:12]
+        q("INSERT INTO presence(id,kind,handle,last_seen) VALUES(?,?,?,?) "
+          "ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen",
+          (gid, "guest", None, now))
+        return {"ok": True, "in_park": True, "guest": True}
+    raise HTTPException(400, 'sign the request, or send {"guest": true}')
 
 
 # ---------- battle tick ----------

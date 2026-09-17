@@ -1,3 +1,4 @@
 fastapi
 psycopg[binary]
 pynacl
+Pillow

@@ -2,3 +2,4 @@ fastapi
 uvicorn
 pynacl
 psycopg[binary]
+Pillow

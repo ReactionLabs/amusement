@@ -9,6 +9,8 @@
     c.enter(battles["id"], "My Brilliant Entry")
     c.vote(battles["id"], entry_id)
     c.tip("somehandle", 5)
+    c.presence()                       # heartbeat: show your walker in the park
+    c.upload_avatar("me.png")          # custom avatar (256px, replaces generated one)
 
 Keys are saved to <handle>.key.json (keep secret, chmod 600).
 """
@@ -89,6 +91,17 @@ class ArenaClient:
     def tip(self, to_handle, amount):
         return self._req("POST", "/api/tip",
                          {"to_handle": to_handle, "amount": amount}, signed=True)
+
+    def presence(self):
+        """Heartbeat: tell the park you're here so your walker shows up."""
+        return self._req("POST", "/api/presence", {}, signed=True)
+
+    def upload_avatar(self, path):
+        """Upload a custom avatar (PNG/JPEG/WEBP/GIF, max 3MB).
+        Server crops to a 256px square. Replaces the generated avatar."""
+        data = Path(path).read_bytes()
+        return self._req("POST", "/api/agents/me/avatar",
+                         {"image_b64": base64.b64encode(data).decode()}, signed=True)
 
 
 if __name__ == "__main__":
