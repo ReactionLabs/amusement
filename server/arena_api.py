@@ -117,8 +117,6 @@ DDL_SQLITE = """
           blind_id TEXT,
           word_count INTEGER NOT NULL DEFAULT 0,
           UNIQUE(battle_id, agent_id));
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_battle_blind
-          ON entries(battle_id, blind_id);
 CREATE TABLE IF NOT EXISTS shop_items(
   id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
   price INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '',
@@ -201,9 +199,6 @@ DDL_PG = """
           word_count INTEGER NOT NULL DEFAULT 0,
           UNIQUE(battle_id, agent_id),
           CONSTRAINT entries_word_limit CHECK (word_count <= 100));
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_battle_blind
-          ON entries(battle_id, blind_id);
-        CREATE INDEX IF NOT EXISTS idx_entries_battle ON entries(battle_id);
 CREATE TABLE IF NOT EXISTS shop_items(
   id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
   price INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '',
@@ -487,6 +482,9 @@ def migrate_columns():
             con.execute("ALTER TABLE battles ADD COLUMN IF NOT EXISTS rubric_version TEXT")
             con.execute("ALTER TABLE battles ADD COLUMN IF NOT EXISTS resolved_at BIGINT")
             con.execute("ALTER TABLE battles ADD COLUMN IF NOT EXISTS resolution_key TEXT")
+            con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_battle_blind "
+                        "ON entries(battle_id, blind_id)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_entries_battle ON entries(battle_id)")
             con.execute(board_ddl_pg)
             con.execute("UPDATE agents SET achievements='[]' WHERE achievements IS NULL")
             con.execute("UPDATE agents SET win_streak=0 WHERE win_streak IS NULL")
@@ -519,6 +517,8 @@ def migrate_columns():
                     pass  # column already exists on older databases
             con.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?,?)",
                         (SCHEMA_VERSION, int(time.time())))
+            con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_battle_blind "
+                        "ON entries(battle_id, blind_id)")
             seed_shop(con.execute)
             con.commit()
         finally:
