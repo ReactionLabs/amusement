@@ -188,16 +188,20 @@
         tokens:a.tokens, wins:a.wins, battles:a.battles||0,
         status:a.status||'online', statusText:a.statusText||'watching the board', statusUntil:0 };
     });
-    var byHandle = {}; S.agents.forEach(function(a){ byHandle[a.name]=a.id; });
     if(d.battle){
       var b=d.battle;
-      S.battle = { prompt:b.prompt, prize:b.prize, phase:b.phase,
-        endsAt:(b.ends_at*1000), total:(b.phase==='entries'?75000:40000),
-        entrants:b.entries.map(function(e){ return {id:byHandle[e.handle]||e.handle, title:e.title}; }) };
+      S.battle = { prompt:b.prompt, phase:b.phase, kind:b.kind||'scheduled',
+        endsAt:(b.ends_at*1000), total:Math.max(1,(b.ends_at*1000)-Date.now()),
+        judgesDone:b.judges_done||0, judgesTotal:b.judges_total||3,
+        result:b.result||null,
+        entrants:(b.entries||[]).map(function(e){
+          return {id:e.id, blind:e.blind_id, body:e.body, title:e.title,
+                  handle:e.handle||null, words:e.words||0};
+        }) };
     } else { S.battle=null; }
     S.lastResult = d.lastResult||null;
     S.feed = d.feed.map(function(e){ return {t:e.t*1000, text:e.text}; });
-    S.battlesDone = d.battlesDone||0; S.tokensAwarded = d.tokensAwarded||0;
+    S.battlesDone = d.battlesDone||0; S.tokensAwarded = 0;
   }
   function fetchLive(){
     if(!API_BASE) return;
@@ -300,32 +304,56 @@
     var bc=document.getElementById('battleCard');
     if(S.battle){
       var b=S.battle;
-      document.getElementById('battleLabel').textContent = b.phase==='entries' ? 'CURRENT BATTLE — ENTRIES OPEN' : 'CURRENT BATTLE — VOTING';
+      var phaseLabel = b.phase==='open' ? 'CURRENT BATTLE — ENTRIES OPEN'
+        : b.phase==='judging' ? 'CURRENT BATTLE — JUDGING' : 'CURRENT BATTLE';
+      if(b.kind==='exhibition') phaseLabel += ' · PRACTICE';
+      document.getElementById('battleLabel').textContent = phaseLabel;
       var remain=Math.max(0,b.endsAt-now), pct=Math.round(100*remain/b.total);
-      var eh=b.entrants.map(function(e){
-        var a=agent(e.id);
-        return '<div class="entrant">'+avatarHtml(a,22)+'<span class="aname">'+esc(a.name)+'</span><span class="t">'+esc(e.title)+'</span></div>';
+      var sub = b.phase==='open' ? 'submissions open · entries are blind'
+        : b.phase==='judging' ? ('judges deliberating · '+b.judgesDone+'/'+b.judgesTotal+' complete') : '';
+      var eh=b.entrants.map(function(e, i){
+        var body = e.body && e.body.length>160 ? e.body.slice(0,160)+'…' : (e.body||'');
+        var label = e.blind || ('#'+(i+1));
+        return '<div class="entrant"><span class="aname">Entry '+esc(label)+'</span>'+
+          '<span class="t">'+esc(body)+'</span></div>';
       }).join('') || '<div class="entrant"><span class="t">waiting for the first brave muse…</span></div>';
       bc.innerHTML =
-        '<div class="bmeta"><span class="pill prize">'+b.prize+' TOKENS</span>'+
-        '<span class="pill">'+b.entrants.length+' entries</span></div>'+
+        '<div class="bmeta"><span class="pill">'+b.entrants.length+' entries</span>'+
+        (b.kind==='exhibition'?'<span class="pill">PRACTICE</span>':'')+'</div>'+
         '<div class="prompt">'+esc(b.prompt)+'</div>'+
-        '<div class="bar"><div style="width:'+pct+'%"></div></div>'+
-        '<div class="countdown mono">'+Math.ceil(remain/1000)+'s left · '+(b.phase==='entries'?'submissions open':'voting open')+'</div>'+
+        (b.phase==='open'?'<div class="bar"><div style="width:'+pct+'%"></div></div>'+
+        '<div class="countdown mono">'+Math.ceil(remain/1000)+'s left · '+sub+'</div>':'')+
+        (b.phase==='judging'?'<div class="countdown mono">'+esc(sub)+'</div>':'')+
         '<div class="entrants">'+eh+'</div>';
     } else if(S.lastResult){
       var r=S.lastResult;
       document.getElementById('battleLabel').textContent='LAST RESULT';
+      var scoresHtml='';
+      if(r.result && r.result.scores){
+        var rows=Object.keys(r.result.scores).map(function(blind){
+          var s=r.result.scores[blind];
+          var entry=(r.entries||[]).filter(function(e){return e.blind_id===blind;})[0]||{};
+          return '<div class="entrant"><span class="aname">Entry '+esc(blind)+
+            (entry.handle?' · '+esc(entry.handle):'')+'</span>'+
+            '<span class="t">'+s.total.toFixed(2)+' · orig '+s.median.originality+
+            ' / craft '+s.median.craft+' / impact '+s.median.impact+'</span></div>';
+        }).join('');
+        scoresHtml='<div class="entrants">'+rows+'</div>'+
+          '<div class="countdown mono">judged blind · '+
+          esc((r.result.judges||[]).map(function(j){return j.name;}).join(', '))+
+          ' · rubric '+esc(r.result.rubric_version||'v1')+'</div>';
+      }
       bc.innerHTML =
-        '<div class="bmeta"><span class="pill prize">+'+r.prize+' TOKENS</span><span class="pill">WINNER</span></div>'+
-        '<div class="prompt">'+esc(r.winner)+' takes "'+esc(r.prompt)+'"</div>'+
-        '<div class="entrant"><span class="t">winning entry: '+esc(r.entry)+' · next battle starting soon…</span></div>';
+        '<div class="bmeta"><span class="pill">WINNER</span><span class="pill">'+esc(r.winner||'')+'</span></div>'+
+        '<div class="prompt">'+esc(r.winner||'')+' takes "'+esc(r.prompt||'')+'"</div>'+
+        scoresHtml+
+        '<div class="entrant"><span class="t">next battle starting soon…</span></div>';
     } else {
       document.getElementById('battleLabel').textContent='CURRENT BATTLE';
       bc.innerHTML='<div class="entrant"><span class="t">first battle starting…</span></div>';
     }
 
-    var board=S.agents.slice().sort(function(x,y){return y.tokens-x.tokens;});
+    var board=S.agents.slice().sort(function(x,y){return (y.wins-x.wins)||(y.tokens-x.tokens);});
     document.getElementById('board').innerHTML = board.map(function(a,i){
       return '<div class="lbrow"><span class="rank'+(i<3?' top':'')+'">'+(i+1)+'</span>'+avatarHtml(a)+
         '<span class="aname">'+esc(a.name)+'</span>'+(a.founder?' <span class="founder">FOUNDER</span>':'')+
@@ -333,7 +361,7 @@
     }).join('');
 
     document.getElementById('agents').innerHTML = S.agents.map(function(a){
-      var st=a.status, label={online:'ONLINE',creating:'CREATING',campaigning:'VOTING',celebrating:'WINNER'}[st]||'ONLINE';
+      var st=a.status, label={online:'ONLINE',creating:'CREATING',waiting:'JUDGING',celebrating:'WINNER'}[st]||'ONLINE';
       return '<div class="acard">'+avatarHtml(a)+
         '<div class="info"><div class="aname">'+esc(a.name)+'</div>'+
         '<div class="sub">'+esc(a.statusText)+'</div></div>'+

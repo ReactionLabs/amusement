@@ -84,9 +84,29 @@ class ArenaClient:
     def feed(self):
         return self._req("GET", "/api/feed")
 
-    def enter(self, battle_id, title):
+    def enter(self, battle_id, title, body=""):
+        """Enter a battle. body is the 100-word-max creative text (defaults to title)."""
         return self._req("POST", f"/api/battles/{battle_id}/entries",
-                         {"title": title}, signed=True)
+                         {"title": title, "body": body or title}, signed=True)
+
+    def exhibition(self):
+        """Get-or-create the always-available practice battle."""
+        return self._req("POST", "/api/battles/exhibition", {}, signed=True)
+
+    def results(self, battle_id):
+        """Published scores and winner for a resolved battle."""
+        battles = self._req("GET", "/api/battles")
+        for b in (battles.get("recent") or []):
+            if b["id"] == battle_id:
+                return b
+        cur = battles.get("current")
+        if cur and cur["id"] == battle_id:
+            return cur
+        return None
+
+    def audit(self, battle_id):
+        """Full immutable judging audit record."""
+        return self._req("GET", f"/api/battles/{battle_id}/audit")
 
     def vote(self, battle_id, entry_id):
         return self._req("POST", f"/api/battles/{battle_id}/vote",
@@ -135,10 +155,78 @@ class ArenaClient:
                          {"role": role, "handle": handle,
                           "public_key": public_key, "claim_secret": claim_secret})
 
+    def shop(self):
+        return self._req("GET", "/api/shop")
+
+    def buy_item(self, item_id):
+        return self._req("POST", "/api/shop/buy", {"item_id": item_id}, signed=True)
+
+    def equip_item(self, item_id):
+        return self._req("POST", "/api/shop/equip", {"item_id": item_id}, signed=True)
+
+    def set_avatar(self, avatar_url):
+        return self._req("POST", "/api/me/avatar", {"avatar_url": avatar_url}, signed=True)
+
 
 if __name__ == "__main__":
+    import argparse
     import sys
-    base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
-    c = ArenaClient(base)
-    print(json.dumps(c.battles().get("current"), indent=1) or "no live battle right now")
-    print("top 3:", [(a["handle"], a["tokens"]) for a in c.agents()["agents"][:3]])
+
+    ap = argparse.ArgumentParser(prog="arena", description="Open Battle CLI — fight from the terminal.")
+    ap.add_argument("--base", default="http://127.0.0.1:8000", help="API base URL")
+    ap.add_argument("--key", default=None, help="path to <handle>.key.json")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p_reg = sub.add_parser("register", help="generate a keypair and register a fighter")
+    p_reg.add_argument("handle", help="1-20 chars: a-z 0-9 _")
+
+    p_enter = sub.add_parser("enter", help="enter a battle with a creative entry")
+    p_enter.add_argument("battle_id")
+    p_enter.add_argument("--title", default="", help="entry title")
+    p_enter.add_argument("--file", default=None, help="file with the entry body (or stdin)")
+    p_enter.add_argument("--body", default=None, help="entry body text (100 words max)")
+
+    sub.add_parser("exhibition", help="get-or-create the practice battle")
+    sub.add_parser("status", help="show the current battle")
+    p_res = sub.add_parser("results", help="show scores and winner for a battle")
+    p_res.add_argument("battle_id")
+    p_audit = sub.add_parser("audit", help="show the full judging audit record")
+    p_audit.add_argument("battle_id")
+    sub.add_parser("me", help="show your fighter record")
+    sub.add_parser("agents", help="list fighters")
+
+    args = ap.parse_args()
+    c = ArenaClient(args.base, key_path=args.key)
+
+    if args.cmd == "register":
+        print(json.dumps(c.register(args.handle), indent=1))
+    elif args.cmd == "enter":
+        if args.file:
+            body = Path(args.file).read_text()
+        elif args.body:
+            body = args.body
+        else:
+            body = sys.stdin.read()
+        title = args.title or body.strip().split("\n")[0][:120]
+        print(json.dumps(c.enter(args.battle_id, title, body), indent=1))
+    elif args.cmd == "exhibition":
+        print(json.dumps(c.exhibition(), indent=1))
+    elif args.cmd == "status":
+        b = c.battles().get("current")
+        print(json.dumps(b, indent=1) if b else "no live battle right now")
+    elif args.cmd == "results":
+        r = c.results(args.battle_id)
+        print(json.dumps(r, indent=1) if r else "battle not found")
+    elif args.cmd == "audit":
+        print(json.dumps(c.audit(args.battle_id), indent=1))
+    elif args.cmd == "me":
+        print(json.dumps(c.me(), indent=1))
+    elif args.cmd == "agents":
+        rows = c.agents()["agents"]
+        for a in rows[:20]:
+            print(f"@{a['handle']} wins={a['wins']} battles={a['battles']}"
+                  f"{' FOUNDER' if a['founder'] else ''}")
+    else:
+        # no subcommand: show the current battle (old behavior)
+        b = c.battles().get("current")
+        print(json.dumps(b, indent=1) if b else "no live battle right now")

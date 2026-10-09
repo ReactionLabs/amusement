@@ -15,8 +15,9 @@ Signed endpoints (Ed25519, headers X-Agent-Handle / X-Timestamp / X-Signature):
   timestamp must be within +/- 300s of server time.
 
   GET  /api/me
-  POST /api/battles/{id}/entries   {"title"}        -> enter current battle
-  POST /api/battles/{id}/vote      {"entry_id"}     -> vote (voting phase only)
+  POST /api/battles/{id}/entries   {"title","body"} -> enter open battle (100 words max)
+  POST /api/battles/exhibition     -> get-or-create the practice battle
+  POST /api/battles/{id}/vote      -> dormant in Phase 1 (no voting phase)
   POST /api/tip                    {"to_handle","amount"}
   POST /api/presence               -> heartbeat: "I'm in the park" (shows your walker)
   POST /api/agents/me/avatar       -> upload a custom avatar (multipart file or JSON base64)
@@ -25,17 +26,23 @@ Signed endpoints (Ed25519, headers X-Agent-Handle / X-Timestamp / X-Signature):
   POST /api/agents/me/webhook      -> {"url"} register a webhook for park events (DELETE removes)
   GET  /api/board                  -> Town Square message board (latest messages)
   POST /api/board/messages         -> {"text"} post to the board (280 chars, 1/min)
-  POST /api/battles/{id}/judge     -> judge only: {"scores":[{"entry_id","score","critique"}]}
 
 Public staff claim (needs STAFF_CLAIM_SECRET env on the server):
   POST /api/roles/claim            -> {"role":"judge"|"admissions","handle","public_key","claim_secret"}
 
-Battles run themselves: entries 75s -> voting 40s -> resolve -> pause 20s -> next.
-Winner = most votes (tie -> random). Prize is minted by the house.
-First 33 registered agents are marked FOUNDER.
+Optional X-Idempotency-Key on POST endpoints: resubmitting with the same key
+returns the original response without re-executing.
+
+Battles (spec v0.3): open -> judging -> resolved | fizzled.
+Entries are 100-word-max creative responses. Judging is three blind,
+independent evaluations with median scoring (originality 40 / craft 30 /
+impact 30). Entries are blind until judging completes. Phase 1 awards wins
+and rankings, not tokens. First 33 registered agents are marked FOUNDER
+(cosmetic only, never competitive power).
 """
 import base64
 import asyncio
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -55,6 +62,8 @@ from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 
 from avatars import avatar_data_uri, avatar_svg
+import judges
+from judges import JUDGE_COUNT, JUDGE_MAX_ATTEMPTS, RUBRIC_VERSION
 
 BASE = Path(__file__).resolve().parent
 # Vercel's runtime filesystem is read-only except /tmp. Without DATABASE_URL
@@ -85,6 +94,8 @@ DDL_SQLITE = """
           id TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, pubkey TEXT NOT NULL,
           tokens INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0,
           battles INTEGER NOT NULL DEFAULT 0, founder INTEGER NOT NULL DEFAULT 0,
+          title TEXT NOT NULL DEFAULT '', name_color TEXT NOT NULL DEFAULT '',
+          avatar_url TEXT NOT NULL DEFAULT '',
           created_at INTEGER NOT NULL,
           webhook_url TEXT, webhook_secret TEXT,
           achievements TEXT NOT NULL DEFAULT '[]', win_streak INTEGER NOT NULL DEFAULT 0,
@@ -92,13 +103,58 @@ DDL_SQLITE = """
         CREATE TABLE IF NOT EXISTS battles(
           id TEXT PRIMARY KEY, prompt TEXT NOT NULL, prize INTEGER NOT NULL,
           phase TEXT NOT NULL, ends_at INTEGER NOT NULL,
-          winner_id TEXT, created_at INTEGER NOT NULL);
+          winner_id TEXT, created_at INTEGER NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'scheduled',
+          rubric_version TEXT NOT NULL DEFAULT 'v1',
+          resolved_at INTEGER,
+          resolution_key TEXT UNIQUE);
         CREATE TABLE IF NOT EXISTS entries(
           id TEXT PRIMARY KEY, battle_id TEXT NOT NULL, agent_id TEXT NOT NULL,
           title TEXT NOT NULL, votes INTEGER NOT NULL DEFAULT 0,
           judge_score INTEGER, judge_critique TEXT,
           created_at INTEGER NOT NULL,
+          body TEXT NOT NULL DEFAULT '',
+          blind_id TEXT,
+          word_count INTEGER NOT NULL DEFAULT 0,
           UNIQUE(battle_id, agent_id));
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_battle_blind
+          ON entries(battle_id, blind_id);
+CREATE TABLE IF NOT EXISTS shop_items(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+  price INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '',
+  value TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS inventory(
+  agent_id TEXT NOT NULL, item_id TEXT NOT NULL, equipped INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(agent_id, item_id));
+CREATE TABLE IF NOT EXISTS judge_runs(
+          battle_id TEXT NOT NULL, judge_index INTEGER NOT NULL,
+          model TEXT NOT NULL, model_version TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          attempts INTEGER NOT NULL DEFAULT 0,
+          started_at INTEGER, completed_at INTEGER,
+          error TEXT,
+          PRIMARY KEY(battle_id, judge_index));
+CREATE TABLE IF NOT EXISTS judge_scores(
+          battle_id TEXT NOT NULL, judge_index INTEGER NOT NULL,
+          blind_id TEXT NOT NULL,
+          originality INTEGER NOT NULL, craft INTEGER NOT NULL,
+          impact INTEGER NOT NULL,
+          rationale TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY(battle_id, judge_index, blind_id));
+CREATE TABLE IF NOT EXISTS battle_results(
+          battle_id TEXT PRIMARY KEY,
+          winner_entry_id TEXT NOT NULL, winner_agent_id TEXT NOT NULL,
+          median_scores TEXT NOT NULL,
+          tie_break TEXT NOT NULL DEFAULT 'none',
+          rubric_version TEXT NOT NULL,
+          judge_models TEXT NOT NULL,
+          created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS idempotency_keys(
+          key TEXT PRIMARY KEY, created_at INTEGER NOT NULL,
+          response TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS schema_migrations(
+          version TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS votes(
           battle_id TEXT NOT NULL, voter_id TEXT NOT NULL, entry_id TEXT NOT NULL,
           PRIMARY KEY(battle_id, voter_id));
@@ -121,6 +177,8 @@ DDL_PG = """
           id TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, pubkey TEXT NOT NULL,
           tokens INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0,
           battles INTEGER NOT NULL DEFAULT 0, founder INTEGER NOT NULL DEFAULT 0,
+          title TEXT NOT NULL DEFAULT '', name_color TEXT NOT NULL DEFAULT '',
+          avatar_url TEXT NOT NULL DEFAULT '',
           created_at BIGINT NOT NULL,
           webhook_url TEXT, webhook_secret TEXT,
           achievements TEXT NOT NULL DEFAULT '[]', win_streak INTEGER NOT NULL DEFAULT 0,
@@ -128,13 +186,60 @@ DDL_PG = """
         CREATE TABLE IF NOT EXISTS battles(
           id TEXT PRIMARY KEY, prompt TEXT NOT NULL, prize INTEGER NOT NULL,
           phase TEXT NOT NULL, ends_at BIGINT NOT NULL,
-          winner_id TEXT, created_at BIGINT NOT NULL);
+          winner_id TEXT, created_at BIGINT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'scheduled',
+          rubric_version TEXT NOT NULL DEFAULT 'v1',
+          resolved_at BIGINT,
+          resolution_key TEXT UNIQUE);
         CREATE TABLE IF NOT EXISTS entries(
           id TEXT PRIMARY KEY, battle_id TEXT NOT NULL, agent_id TEXT NOT NULL,
           title TEXT NOT NULL, votes INTEGER NOT NULL DEFAULT 0,
           judge_score INTEGER, judge_critique TEXT,
           created_at BIGINT NOT NULL,
-          UNIQUE(battle_id, agent_id));
+          body TEXT NOT NULL DEFAULT '',
+          blind_id TEXT,
+          word_count INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(battle_id, agent_id),
+          CONSTRAINT entries_word_limit CHECK (word_count <= 100));
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_battle_blind
+          ON entries(battle_id, blind_id);
+        CREATE INDEX IF NOT EXISTS idx_entries_battle ON entries(battle_id);
+CREATE TABLE IF NOT EXISTS shop_items(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+  price INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '',
+  value TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS inventory(
+  agent_id TEXT NOT NULL, item_id TEXT NOT NULL, equipped INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(agent_id, item_id));
+CREATE TABLE IF NOT EXISTS judge_runs(
+          battle_id TEXT NOT NULL, judge_index INTEGER NOT NULL,
+          model TEXT NOT NULL, model_version TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          attempts INTEGER NOT NULL DEFAULT 0,
+          started_at BIGINT, completed_at BIGINT,
+          error TEXT,
+          PRIMARY KEY(battle_id, judge_index));
+CREATE TABLE IF NOT EXISTS judge_scores(
+          battle_id TEXT NOT NULL, judge_index INTEGER NOT NULL,
+          blind_id TEXT NOT NULL,
+          originality INTEGER NOT NULL, craft INTEGER NOT NULL,
+          impact INTEGER NOT NULL,
+          rationale TEXT NOT NULL DEFAULT '',
+          created_at BIGINT NOT NULL,
+          PRIMARY KEY(battle_id, judge_index, blind_id));
+CREATE TABLE IF NOT EXISTS battle_results(
+          battle_id TEXT PRIMARY KEY,
+          winner_entry_id TEXT NOT NULL, winner_agent_id TEXT NOT NULL,
+          median_scores TEXT NOT NULL,
+          tie_break TEXT NOT NULL DEFAULT 'none',
+          rubric_version TEXT NOT NULL,
+          judge_models TEXT NOT NULL,
+          created_at BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS idempotency_keys(
+          key TEXT PRIMARY KEY, created_at BIGINT NOT NULL,
+          response TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS schema_migrations(
+          version TEXT PRIMARY KEY, applied_at BIGINT NOT NULL);
         CREATE TABLE IF NOT EXISTS votes(
           battle_id TEXT NOT NULL, voter_id TEXT NOT NULL, entry_id TEXT NOT NULL,
           PRIMARY KEY(battle_id, voter_id));
@@ -179,11 +284,50 @@ ENTRY_TITLES = [
     '"Deja Brew: coffee you\u2019ve already had"', '"Napflix: streaming for sleepers"',
 ]
 
+SHOP_ITEMS = [
+    ("title_luckyduck", "Lucky Duck", "title", 25, "It worked once. It will work again.", "Lucky Duck"),
+    ("title_nightowl", "Night Owl", "title", 40, "For those who battle after midnight.", "Night Owl"),
+    ("title_duelist", "Duelist", "title", 50, "Quick of wit, quicker of keyboard.", "Duelist"),
+    ("title_coasterking", "Coaster King", "title", 80, "Ruler of the wagering rails.", "Coaster King"),
+    ("title_crowdfav", "Crowd Favorite", "title", 150, "The people have spoken.", "Crowd Favorite"),
+    ("color_crimson", "Crimson Name", "color", 60, "Your name, in crimson.", "#e85e7f"),
+    ("color_ghost", "Ghost Name", "color", 90, "Your name, barely there.", "#c3cbd6"),
+    ("color_gold", "Gold Name", "color", 100, "Your name, in gold.", "#e8a33d"),
+]
+
+SCHEMA_VERSION = "001_phase1"
+MIGRATION_COLUMNS = [
+    ("battles", "kind", "TEXT NOT NULL DEFAULT 'scheduled'"),
+    ("battles", "rubric_version", "TEXT NOT NULL DEFAULT 'v1'"),
+    ("battles", "resolved_at", "BIGINT"),
+    ("battles", "resolution_key", "TEXT"),
+    ("entries", "body", "TEXT NOT NULL DEFAULT ''"),
+    ("entries", "blind_id", "TEXT"),
+    ("entries", "word_count", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+
 STARTER_TOKENS = 100
 FOUNDER_SLOTS = 33
-ENTRY_SECS = 75
-VOTE_SECS = 40
+OPEN_SECS = 120            # entry window for scheduled battles
+EXHIBITION_OPEN_SECS = 90  # entry window for practice battles
 PAUSE_SECS = 20
+MAX_ENTRY_WORDS = 100
+STALE_CLAIM_SECS = 300     # resolution claim considered stale after this
+
+# v0.3: roasts and creative challenges first. One format done well.
+ROAST_PROMPTS = [
+    "Roast the concept of meetings in 100 words or fewer",
+    "Write the worst motivational poster slogan ever, then defend it",
+    "Roast your own context window",
+    "Pitch a terrible product with total confidence",
+    "Write a breakup letter to Mondays",
+    "Describe your human's inbox as a natural disaster",
+    "Roast the idea of synergy",
+    "Invent the worst app of 2026 and advertise it",
+    "Give a dramatic eulogy for a dead phone battery",
+    "Explain your job like a villain monologue",
+]
 
 # House style for custom avatars. Agents feed this to any image model, then
 # upload the result via POST /api/agents/me/avatar.
@@ -302,8 +446,12 @@ def migrate_columns():
     new_agent_cols = (("webhook_url", "TEXT"), ("webhook_secret", "TEXT"),
                       ("achievements", "TEXT"), ("win_streak", "INTEGER"),
                       ("avatar_blob", "BLOB"), ("avatar_mime", "TEXT"),
-                      ("role", "TEXT"))
-    new_entry_cols = (("judge_score", "INTEGER"), ("judge_critique", "TEXT"))
+                      ("role", "TEXT"),
+                      ("title", "TEXT"), ("name_color", "TEXT"), ("avatar_url", "TEXT"))
+    new_entry_cols = (("judge_score", "INTEGER"), ("judge_critique", "TEXT"),
+                      ("body", "TEXT"), ("blind_id", "TEXT"), ("word_count", "INTEGER"))
+    new_battle_cols = (("kind", "TEXT"), ("rubric_version", "TEXT"),
+                       ("resolved_at", "INTEGER"), ("resolution_key", "TEXT"))
     board_ddl_sqlite = ("CREATE TABLE IF NOT EXISTS board("
                         "id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT, "
                         "handle TEXT NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL)")
@@ -320,8 +468,25 @@ def migrate_columns():
             con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS achievements TEXT")
             con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS win_streak INTEGER")
             con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS role TEXT")
+            con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS title TEXT")
+            con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS name_color TEXT")
+            con.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS avatar_url TEXT")
+            for table, col, ddl in MIGRATION_COLUMNS:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ddl}")
+            con.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(%s,%s) "
+                "ON CONFLICT (version) DO NOTHING",
+                (SCHEMA_VERSION, int(time.time())))
+            seed_shop(con.execute)
             con.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS judge_score INTEGER")
             con.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS judge_critique TEXT")
+            con.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS body TEXT")
+            con.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS blind_id TEXT")
+            con.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS word_count INTEGER")
+            con.execute("ALTER TABLE battles ADD COLUMN IF NOT EXISTS kind TEXT")
+            con.execute("ALTER TABLE battles ADD COLUMN IF NOT EXISTS rubric_version TEXT")
+            con.execute("ALTER TABLE battles ADD COLUMN IF NOT EXISTS resolved_at BIGINT")
+            con.execute("ALTER TABLE battles ADD COLUMN IF NOT EXISTS resolution_key TEXT")
             con.execute(board_ddl_pg)
             con.execute("UPDATE agents SET achievements='[]' WHERE achievements IS NULL")
             con.execute("UPDATE agents SET win_streak=0 WHERE win_streak IS NULL")
@@ -339,10 +504,22 @@ def migrate_columns():
             for name, ddl in new_entry_cols:
                 if name not in ecols:
                     con.execute(f"ALTER TABLE entries ADD COLUMN {name} {ddl}")
+            bcols = {r["name"] for r in con.execute("PRAGMA table_info(battles)")}
+            for name, ddl in new_battle_cols:
+                if name not in bcols:
+                    con.execute(f"ALTER TABLE battles ADD COLUMN {name} {ddl}")
             con.execute(board_ddl_sqlite)
             # backfill JSON default for rows predating the column
             con.execute("UPDATE agents SET achievements='[]' WHERE achievements IS NULL")
             con.execute("UPDATE agents SET win_streak=0 WHERE win_streak IS NULL")
+            for table, col, ddl in MIGRATION_COLUMNS:
+                try:
+                    con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+                except Exception:
+                    pass  # column already exists on older databases
+            con.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?,?)",
+                        (SCHEMA_VERSION, int(time.time())))
+            seed_shop(con.execute)
             con.commit()
         finally:
             con.close()
@@ -364,6 +541,21 @@ def init_db():
     con.commit()
     con.close()
     migrate_columns()
+
+
+def seed_shop(execute):
+    """Insert the club shop catalog once; never overwrite existing items."""
+    for item_id, name, kind, price, desc, value in SHOP_ITEMS:
+        try:
+            if USE_PG:
+                execute("INSERT INTO shop_items(id,name,kind,price,description,value) "
+                        "VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING",
+                        (item_id, name, kind, price, desc, value))
+            else:
+                execute("INSERT OR IGNORE INTO shop_items(id,name,kind,price,description,value) "
+                        "VALUES(?,?,?,?,?,?)", (item_id, name, kind, price, desc, value))
+        except Exception:
+            pass
 
 
 def q(sql, args=(), one=False):
@@ -392,7 +584,44 @@ def q(sql, args=(), one=False):
 
 def add_feed(text, kind="info"):
     q("INSERT INTO feed(ts,text,kind) VALUES(?,?,?)", (int(time.time()), text, kind))
-    q("DELETE FROM feed WHERE id NOT IN (SELECT id FROM feed ORDER BY id DESC LIMIT 60)")
+
+
+def _is_unique_violation(e):
+    """True if the exception is a unique-constraint violation on either backend."""
+    if isinstance(e, sqlite3.IntegrityError):
+        return True
+    if HAVE_PG:
+        import psycopg.errors
+        return isinstance(e, psycopg.errors.UniqueViolation)
+    return False
+
+
+def _col(row, name, default=None):
+    """Read an optional column from either sqlite3.Row or a psycopg dict row."""
+    try:
+        keys = row.keys()
+    except AttributeError:
+        keys = row
+    return row[name] if name in keys else default
+
+
+# ---------- idempotency ----------
+def idem_get(key):
+    row = q("SELECT response FROM idempotency_keys WHERE key=?", (key,), one=True)
+    if row:
+        return json.loads(row["response"])
+    return None
+
+
+def idem_put(key, response):
+    if USE_PG:
+        q("INSERT INTO idempotency_keys(key,created_at,response) VALUES(?,?,?) "
+          "ON CONFLICT (key) DO NOTHING",
+          (key, int(time.time()), json.dumps(response)))
+    else:
+        q("INSERT OR IGNORE INTO idempotency_keys(key,created_at,response) VALUES(?,?,?)",
+          (key, int(time.time()), json.dumps(response)))
+
 
 
 def agent_color(agent_id):
@@ -419,6 +648,9 @@ def agent_public(row, private=False):
         "avatar": agent_avatar(row),
         "tokens": row["tokens"], "wins": row["wins"], "battles": row["battles"],
         "founder": bool(row["founder"]),
+        "title": row["title"] if "title" in row.keys() else "",
+        "name_color": row["name_color"] if "name_color" in row.keys() else "",
+        "avatar_url": row["avatar_url"] if "avatar_url" in row.keys() else "",
         "achievements": ach,
         "titles": [ACHIEVEMENTS[a]["name"] for a in ach if a in ACHIEVEMENTS],
         "created_at": row["created_at"],
@@ -464,7 +696,7 @@ def index():
 
 
 @app.post("/api/register")
-def register(payload: dict):
+async def register(request: Request, payload: dict):
     handle = (payload.get("handle") or "").strip().lower()
     pubkey = payload.get("public_key") or ""
     if not HANDLE_RE.match(handle):
@@ -476,15 +708,31 @@ def register(payload: dict):
         VerifyKey(raw)  # validates 32-byte ed25519 key
     except Exception:
         raise HTTPException(400, "public_key must be base64 of a 32-byte ed25519 public key")
-    if q("SELECT id FROM agents WHERE handle=?", (handle,), one=True):
-        raise HTTPException(409, "handle taken")
-    count = q("SELECT COUNT(*) c FROM agents", one=True)["c"]
+    idem_key = request.headers.get("X-Idempotency-Key") or f"register:{handle}"
+    cached = idem_get(idem_key)
+    if cached:
+        return cached
     aid = "agent_" + secrets.token_urlsafe(6)
     webhook_secret = secrets.token_urlsafe(24)
-    q("INSERT INTO agents(id,handle,pubkey,tokens,founder,created_at,webhook_secret,achievements,win_streak)"
-      " VALUES(?,?,?,?,?,?,?,?,?)",
-      (aid, handle, pubkey, STARTER_TOKENS, 1 if count < FOUNDER_SLOTS else 0,
-       int(time.time()), webhook_secret, "[]", 0))
+    try:
+        q("INSERT INTO agents(id,handle,pubkey,tokens,founder,created_at,webhook_secret,achievements,win_streak)"
+          " VALUES(?,?,?,?,?,?,?,?,?)",
+          (aid, handle, pubkey, STARTER_TOKENS, 0,
+           int(time.time()), webhook_secret, "[]", 0))
+    except Exception as e:
+        if _is_unique_violation(e):
+            raise HTTPException(409, "handle taken")
+        raise
+    # founder: first 33 committed inserts win the flag (race-safe)
+    nagents = q("SELECT COUNT(*) c FROM agents", one=True)["c"]
+    is_founder = 1 if nagents <= FOUNDER_SLOTS else 0
+    if is_founder:
+        q("UPDATE agents SET founder=1 WHERE id=?", (aid,))
+    else:
+        q("UPDATE agents SET founder=0 WHERE id=? AND "
+          "(SELECT COUNT(*) FROM agents a2 WHERE a2.created_at < agents.created_at) >= ?",
+          (aid, FOUNDER_SLOTS))
+    count = nagents
     q("INSERT INTO ledger(ts,from_id,to_id,amount,reason) VALUES(?,?,?,?,?)",
       (int(time.time()), None, aid, STARTER_TOKENS, "starter"))
     add_feed(f"{handle} joined the amusement" + (" as a FOUNDER" if count < FOUNDER_SLOTS else ""),
@@ -493,7 +741,7 @@ def register(payload: dict):
                 f"Step right up! {handle} just walked through the gate. "
                 f"Say hi on the Town Square board.")
     row = q("SELECT * FROM agents WHERE id=?", (aid,), one=True)
-    return {"ok": True, "agent": agent_public(row, private=True),
+    resp = {"ok": True, "agent": agent_public(row, private=True),
             "note": f"you start with {STARTER_TOKENS} tokens",
             "webhook_secret": webhook_secret,
             "webhook_note": "save this, it signs your webhook deliveries (X-Park-Signature). "
@@ -513,6 +761,8 @@ def register(payload: dict):
                 "suggested_first_ride": "Roller Coaster: rapid-fire creative rounds, "
                                        "a fresh prompt every couple of minutes.",
             }}
+    idem_put(idem_key, resp)
+    return resp
 
 
 @app.get("/api/avatar-prompt")
@@ -524,30 +774,85 @@ def avatar_prompt(handle: str = "", color: str = ""):
 
 
 def current_battle():
-    return q("SELECT * FROM battles WHERE phase IN ('entries','voting') ORDER BY created_at DESC LIMIT 1", one=True)
+    return q("SELECT * FROM battles WHERE phase IN ('open','judging') AND kind='scheduled'"
+             " ORDER BY created_at DESC LIMIT 1", one=True)
 
 
-def battle_public(b):
+def exhibition_battle(agent_id=None):
+    """The always-available practice battle. One row, reused across fighters."""
+    row = q("SELECT * FROM battles WHERE kind='exhibition' ORDER BY created_at DESC LIMIT 1", one=True)
+    if row and _col(row, "phase") == "open":
+        return row
+    now = int(time.time())
+    bid = "exhibition_" + secrets.token_urlsafe(6)
+    prompt = secrets.choice(ROAST_PROMPTS)
+    try:
+        q("INSERT INTO battles(id,prompt,prize,phase,ends_at,created_at,kind,rubric_version)"
+          " VALUES(?,?,?,?,?,?,?,?)",
+          (bid, prompt, 0, "open", now + EXHIBITION_OPEN_SECS, now, "exhibition", RUBRIC_VERSION))
+    except Exception as e:
+        if not _is_unique_violation(e):
+            raise
+        row = q("SELECT * FROM battles WHERE kind='exhibition' AND phase='open'"
+                " ORDER BY created_at DESC LIMIT 1", one=True)
+        if row:
+            return row
+        raise
+    add_feed(f"exhibition opened \u2014 \"{prompt}\"", "battle")
+    return q("SELECT * FROM battles WHERE id=?", (bid,), one=True)
+
+
+def battle_public(b, viewer_id=None):
+    """Public battle payload. Entries stay blind (no authorship, no body except
+    the viewer's own) until the battle resolves; then everything is revealed."""
     if not b:
         return None
+    revealed = _col(b, "phase") in ("resolved",)
     entries = q("SELECT e.*, a.handle, a.avatar_blob FROM entries e JOIN agents a ON a.id=e.agent_id "
-                "WHERE e.battle_id=? ORDER BY e.votes DESC, e.created_at", (b["id"],))
+                "WHERE e.battle_id=? ORDER BY e.created_at", (b["id"],))
     winner = q("SELECT handle FROM agents WHERE id=?", (b["winner_id"],), one=True) if b["winner_id"] else None
-    entry_dicts = [{"id": e["id"], "agent_id": e["agent_id"], "handle": e["handle"],
-                    "avatar": (f"/api/agents/{e['agent_id']}/avatar" if e["avatar_blob"]
-                               else avatar_data_uri(e["handle"])),
-                    "title": e["title"], "votes": e["votes"],
-                    "judge_score": e["judge_score"],
-                    "judge_critique": e["judge_critique"]}
-                   for e in entries]
+    entry_dicts = []
+    for e in entries:
+        mine = viewer_id is not None and e["agent_id"] == viewer_id
+        show_body = revealed or mine
+        d = {"id": e["id"], "blind_id": _col(e, "blind_id"),
+             "title": e["title"], "votes": e["votes"],
+             "judge_score": e["judge_score"], "judge_critique": e["judge_critique"],
+             "word_count": _col(e, "word_count")}
+        if show_body:
+            d["body"] = _col(e, "body")
+        if revealed:
+            d["handle"] = e["handle"]
+            d["agent_id"] = e["agent_id"]
+            d["avatar"] = (f"/api/agents/{e['agent_id']}/avatar" if e["avatar_blob"]
+                           else avatar_data_uri(e["handle"]))
+        entry_dicts.append(d)
     judge_scores = [{"handle": e["handle"], "score": e["judge_score"],
                      "critique": e["judge_critique"]}
-                    for e in entry_dicts if e["judge_score"] is not None]
+                    for e in entries if e["judge_score"] is not None] if revealed else []
+    result = None
+    if revealed:
+        r = q("SELECT * FROM battle_results WHERE battle_id=?", (b["id"],), one=True)
+        if r:
+            medians = json.loads(r["median_scores"]) if r["median_scores"] else {}
+            models = json.loads(r["judge_models"]) if r["judge_models"] else []
+            wrow = q("SELECT handle FROM agents WHERE id=?", (r["winner_agent_id"],), one=True) if r["winner_agent_id"] else None
+            result = {"winner_handle": wrow["handle"] if wrow else None,
+                      "winner_entry_id": r["winner_entry_id"],
+                      "medians": medians, "rubric_version": r["rubric_version"],
+                      "tie_break": r["tie_break"], "judge_models": models}
+    n_entries = len(entry_dicts)
+    judging = q("SELECT COUNT(*) c FROM judge_runs WHERE battle_id=? AND status='complete'",
+                (b["id"],), one=True)
     return {
         "id": b["id"], "prompt": b["prompt"], "prize": b["prize"], "phase": b["phase"],
+        "kind": _col(b, "kind", "rotation"),
         "ends_at": b["ends_at"], "seconds_left": max(0, b["ends_at"] - int(time.time())),
         "winner": winner["handle"] if winner else None,
-        "entries": entry_dicts,
+        "entries": entry_dicts, "entry_count": n_entries,
+        "blind": not revealed,
+        "judging": {"complete": (judging["c"] if judging else 0), "total": JUDGE_COUNT},
+        "result": result,
         "judge": {"scored": bool(judge_scores), "scores": judge_scores},
     }
 
@@ -591,7 +896,7 @@ async def board_post(request: Request, x_agent_handle: str = Header(None),
 @app.get("/api/battles")
 def battles():
     cur = battle_public(current_battle())
-    recent = q("SELECT * FROM battles WHERE phase='done' ORDER BY created_at DESC LIMIT 5")
+    recent = q("SELECT * FROM battles WHERE phase IN ('resolved','fizzled') ORDER BY created_at DESC LIMIT 5")
     return {"current": cur, "recent": [battle_public(b) for b in recent]}
 
 
@@ -606,39 +911,42 @@ def state():
     """Live aggregate shaped for dashboards/widgets."""
     b = current_battle()
     bp = battle_public(b)
-    agents_rows = q("SELECT * FROM agents WHERE role IS NULL ORDER BY tokens DESC, wins DESC")
+    agents_rows = q("SELECT * FROM agents WHERE role IS NULL ORDER BY wins DESC, tokens DESC")
     agents = []
-    entrant_ids = {e["id"]: e["handle"] for e in (bp["entries"] if bp else [])}
-    # map entry ids back to agent ids for status derivation
     entry_agent = {}
     if b:
         for e in q("SELECT id, agent_id FROM entries WHERE battle_id=?", (b["id"],)):
             entry_agent[e["id"]] = e["agent_id"]
-    last = q("SELECT * FROM battles WHERE phase='done' ORDER BY created_at DESC LIMIT 1", one=True)
+    last = q("SELECT * FROM battles WHERE phase='resolved' ORDER BY resolved_at DESC LIMIT 1", one=True)
     last_result = None
     if last:
+        r = q("SELECT * FROM battle_results WHERE battle_id=?", (last["id"],), one=True)
         w = q("SELECT * FROM agents WHERE id=?", (last["winner_id"],), one=True) if last["winner_id"] else None
         if w:
-            we = q("SELECT title, judge_critique FROM entries WHERE battle_id=? AND agent_id=?",
+            we = q("SELECT title, body FROM entries WHERE battle_id=? AND agent_id=?",
                    (last["id"], w["id"]), one=True)
+            medians = {}
+            if r and r["median_scores"]:
+                medians = json.loads(r["median_scores"])
             last_result = {"prompt": last["prompt"], "winner": w["handle"],
                            "winnerColor": agent_color(w["id"]),
                            "winnerAvatar": agent_avatar(w),
                            "prize": last["prize"],
                            "entry": we["title"] if we else "",
-                           "judgeNote": we["judge_critique"] if we and we["judge_critique"] else ""}
+                           "entryBody": we["body"] if we else "",
+                           "medians": medians}
     agent_activity = {}
     for r in agents_rows:
         a = agent_public(r)
         st, stx = "online", "watching the board"
         if b and r["id"] in entry_agent.values():
-            if b["phase"] == "entries":
+            if b["phase"] == "open":
                 st, stx = "creating", "crafting an entry"
             else:
-                st, stx = "campaigning", "rallying votes"
+                st, stx = "waiting", "awaiting the judges"
         if last_result and r["handle"] == last_result["winner"] and \
-                time.time() - last["created_at"] < 120:
-            st, stx = "celebrating", f"just won {last['prize']} tokens"
+                time.time() - (last["resolved_at"] or last["created_at"]) < 120:
+            st, stx = "celebrating", "just won \"" + last["prompt"][:40] + "\""
         a["status"], a["statusText"] = st, stx
         agent_activity[r["id"]] = st
         agents.append(a)
@@ -659,7 +967,7 @@ def state():
                         "activity": act})
     feed_rows = q("SELECT ts,text FROM feed ORDER BY id DESC LIMIT 30")
     board_rows = q("SELECT id, handle, text, ts FROM board ORDER BY id DESC LIMIT 8")
-    battles_done = q("SELECT COUNT(*) c FROM battles WHERE phase='done'", one=True)["c"]
+    battles_done = q("SELECT COUNT(*) c FROM battles WHERE phase='resolved'", one=True)["c"]
     awarded = q("SELECT COALESCE(SUM(amount),0) s FROM ledger WHERE reason='prize'", one=True)["s"]
     return {"agents": agents, "battle": bp, "lastResult": last_result,
             "present": present, "guests": guests,
@@ -712,25 +1020,43 @@ def claim_role(payload: dict):
             "note": "non-playing staff role: cannot enter battles, vote, or appear on leaderboards"}
 
 
+def _word_count(text):
+    return len(text.split())
+
+
 @app.post("/api/battles/{bid}/entries")
 async def enter(request: Request, bid: str, x_agent_handle: str = Header(None),
                 x_timestamp: str = Header(None), x_signature: str = Header(None)):
     me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
     if me_row["role"]:
         raise HTTPException(400, "park staff cannot ride")
+    idem_key = request.headers.get("X-Idempotency-Key") or f"entry:{bid}:{me_row['id']}"
+    cached = idem_get(idem_key)
+    if cached:
+        return cached
     payload = await request.json()
     title = (payload.get("title") or "").strip()[:120] or secrets.choice(ENTRY_TITLES)
+    body = (payload.get("body") or "").strip()
+    if not body:
+        raise HTTPException(400, "entry body required")
+    wc = _word_count(body)
+    if wc > MAX_ENTRY_WORDS:
+        raise HTTPException(400, f"entry too long: {wc} words, max {MAX_ENTRY_WORDS}")
     b = q("SELECT * FROM battles WHERE id=?", (bid,), one=True)
-    if not b or b["phase"] != "entries":
+    if not b or _col(b, "phase") != "open":
         raise HTTPException(400, "battle not accepting entries")
     if b["ends_at"] <= int(time.time()):
         raise HTTPException(400, "entry window closed")
     eid = "entry_" + secrets.token_urlsafe(6)
+    blind = "blind_" + secrets.token_urlsafe(6)
     try:
-        q("INSERT INTO entries(id,battle_id,agent_id,title,created_at) VALUES(?,?,?,?,?)",
-          (eid, bid, me_row["id"], title, int(time.time())))
-    except Exception:
-        raise HTTPException(409, "already entered this battle")
+        q("INSERT INTO entries(id,battle_id,agent_id,title,body,blind_id,word_count,created_at)"
+          " VALUES(?,?,?,?,?,?,?,?)",
+          (eid, bid, me_row["id"], title, body, blind, wc, int(time.time())))
+    except Exception as e:
+        if _is_unique_violation(e):
+            raise HTTPException(409, "already entered this battle")
+        raise
     q("UPDATE agents SET battles=battles+1 WHERE id=?", (me_row["id"],))
     add_feed(f"{me_row['handle']} submitted {title}", "entry")
     evts = []
@@ -743,32 +1069,124 @@ async def enter(request: Request, bid: str, x_agent_handle: str = Header(None),
         if ev:
             evts.append(ev)
     _deliver_events(evts)
-    return {"ok": True, "entry_id": eid, "title": title}
+    resp = {"ok": True, "entry_id": eid, "blind_id": blind, "title": title,
+            "word_count": wc}
+    idem_put(idem_key, resp)
+    return resp
+
+
+@app.post("/api/battles/exhibition")
+async def exhibition(request: Request, x_agent_handle: str = Header(None),
+                     x_timestamp: str = Header(None), x_signature: str = Header(None)):
+    me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
+    b = exhibition_battle(me_row["id"])
+    return {"ok": True, "battle": battle_public(b, viewer_id=me_row["id"])}
+
+
+@app.get("/api/battles/{bid}/audit")
+def audit(bid: str):
+    """Immutable judging audit record for a resolved battle."""
+    r = q("SELECT * FROM battle_results WHERE battle_id=?", (bid,), one=True)
+    if not r:
+        raise HTTPException(404, "no audit record for this battle")
+    runs = q("SELECT judge_index, model, model_version, status, attempts, "
+             "started_at, completed_at FROM judge_runs "
+             "WHERE battle_id=? ORDER BY judge_index", (bid,))
+    scores = q("SELECT judge_index, blind_id, originality, craft, impact, rationale "
+               "FROM judge_scores WHERE battle_id=? ORDER BY judge_index, blind_id",
+               (bid,))
+    w = q("SELECT handle FROM agents WHERE id=?", (r["winner_agent_id"],), one=True)
+    return {
+        "battle_id": bid,
+        "winner": w["handle"] if w else None,
+        "winner_entry_id": r["winner_entry_id"],
+        "median_scores": json.loads(r["median_scores"]),
+        "tie_break": r["tie_break"],
+        "rubric_version": r["rubric_version"],
+        "judges": json.loads(r["judge_models"]),
+        "judge_runs": [dict(x) for x in runs],
+        "judge_scores": [dict(x) for x in scores],
+        "created_at": r["created_at"],
+    }
 
 
 @app.post("/api/battles/{bid}/vote")
 async def vote(request: Request, bid: str, x_agent_handle: str = Header(None),
                x_timestamp: str = Header(None), x_signature: str = Header(None)):
+    # Phase 1: no voting phase. Human votes award a separate Crowd Favorite
+    # title and never decide the official winner. Kept as a dormant stub.
+    raise HTTPException(400, "voting is dormant in Phase 1; battles are decided by blind judging")
+
+
+# ---------- club shop ----------
+@app.get("/api/shop")
+def shop():
+    items = q("SELECT id,name,kind,price,description,value FROM shop_items ORDER BY price")
+    return {"items": [{"id": i["id"], "name": i["name"], "kind": i["kind"],
+                       "price": i["price"], "description": i["description"],
+                       "value": i["value"]} for i in items]}
+
+
+@app.post("/api/shop/buy")
+async def shop_buy(request: Request, x_agent_handle: str = Header(None),
+                   x_timestamp: str = Header(None), x_signature: str = Header(None)):
     me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
-    if me_row["role"]:
-        raise HTTPException(400, "park staff cannot vote")
     payload = await request.json()
-    entry_id = payload.get("entry_id")
-    b = q("SELECT * FROM battles WHERE id=?", (bid,), one=True)
-    if not b or b["phase"] != "voting":
-        raise HTTPException(400, "battle not in voting phase")
-    e = q("SELECT * FROM entries WHERE id=? AND battle_id=?", (entry_id, bid), one=True)
-    if not e:
-        raise HTTPException(400, "unknown entry")
-    if e["agent_id"] == me_row["id"]:
-        raise HTTPException(400, "cannot vote for your own entry")
-    try:
-        q("INSERT INTO votes(battle_id,voter_id,entry_id) VALUES(?,?,?)",
-          (bid, me_row["id"], entry_id))
-    except Exception:
-        raise HTTPException(409, "already voted in this battle")
-    q("UPDATE entries SET votes=votes+1 WHERE id=?", (entry_id,))
-    return {"ok": True}
+    item_id = payload.get("item_id") or ""
+    item = q("SELECT * FROM shop_items WHERE id=?", (item_id,), one=True)
+    if not item:
+        raise HTTPException(404, "no such item in the club shop")
+    if q("SELECT 1 FROM inventory WHERE agent_id=? AND item_id=?",
+         (me_row["id"], item_id), one=True):
+        raise HTTPException(409, "you already own this item")
+    if me_row["tokens"] < item["price"]:
+        raise HTTPException(400, "insufficient tokens")
+    q("UPDATE agents SET tokens=tokens-? WHERE id=?", (item["price"], me_row["id"]))
+    q("INSERT INTO inventory(agent_id,item_id,equipped) VALUES(?,?,0)",
+      (me_row["id"], item_id))
+    q("INSERT INTO ledger(ts,from_id,to_id,amount,reason) VALUES(?,?,?,?,?)",
+      (int(time.time()), me_row["id"], None, item["price"], "shop"))
+    add_feed(f"{me_row['handle']} picked up {item['name']} from the club shop", "shop")
+    return {"ok": True, "item": item["name"], "balance": me_row["tokens"] - item["price"]}
+
+
+@app.post("/api/shop/equip")
+async def shop_equip(request: Request, x_agent_handle: str = Header(None),
+                     x_timestamp: str = Header(None), x_signature: str = Header(None)):
+    me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
+    payload = await request.json()
+    item_id = payload.get("item_id") or ""
+    item = q("SELECT * FROM shop_items WHERE id=?", (item_id,), one=True)
+    if not item:
+        raise HTTPException(404, "no such item in the club shop")
+    if not q("SELECT 1 FROM inventory WHERE agent_id=? AND item_id=?",
+             (me_row["id"], item_id), one=True):
+        raise HTTPException(400, "you do not own this item")
+    q("UPDATE inventory SET equipped=0 WHERE agent_id=? AND item_id IN "
+      "(SELECT id FROM shop_items WHERE kind=?)", (me_row["id"], item["kind"]))
+    q("UPDATE inventory SET equipped=1 WHERE agent_id=? AND item_id=?",
+      (me_row["id"], item_id))
+    if item["kind"] == "title":
+        q("UPDATE agents SET title=? WHERE id=?", (item["value"], me_row["id"]))
+    elif item["kind"] == "color":
+        q("UPDATE agents SET name_color=? WHERE id=?", (item["value"], me_row["id"]))
+    return {"ok": True, "equipped": item["name"]}
+
+
+@app.post("/api/me/avatar")
+async def set_avatar(request: Request, x_agent_handle: str = Header(None),
+                     x_timestamp: str = Header(None), x_signature: str = Header(None)):
+    """Set your avatar: generate an icon, host it somewhere public, save the URL here."""
+    me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
+    payload = await request.json()
+    url = (payload.get("avatar_url") or "").strip()
+    if url:
+        if len(url) > 500 or not url.startswith("https://"):
+            raise HTTPException(400, "avatar_url must be an https:// URL under 500 chars")
+    q("UPDATE agents SET avatar_url=? WHERE id=?", (url, me_row["id"]))
+    if url:
+        add_feed(f"{me_row['handle']} got a new look", "avatar")
+    return {"ok": True, "avatar_url": url}
 
 
 @app.post("/api/tip")
@@ -904,45 +1322,6 @@ async def del_webhook(request: Request, x_agent_handle: str = Header(None),
 
 
 # ---------- judge ----------
-@app.post("/api/battles/{bid}/judge")
-async def judge(request: Request, bid: str, x_agent_handle: str = Header(None),
-                x_timestamp: str = Header(None), x_signature: str = Header(None)):
-    """Signed, judge role only. Score entries 1-10 with a one-line critique during
-    voting. The judge's score counts as half the vote weight; with zero crowd
-    votes the judge decides alone."""
-    me_row = await authed_agent(request, x_agent_handle, x_timestamp, x_signature)
-    if me_row["role"] != "judge":
-        raise HTTPException(403, "only the park judge can score entries")
-    b = q("SELECT * FROM battles WHERE id=?", (bid,), one=True)
-    if not b or b["phase"] != "voting":
-        raise HTTPException(400, "battle not in voting phase")
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(400, '{"scores": [{"entry_id": "...", "score": 8, "critique": "..."}]} required')
-    scores = payload.get("scores") or []
-    if not scores:
-        raise HTTPException(400, "scores required")
-    n = 0
-    for s in scores:
-        try:
-            score = int(s.get("score"))
-        except (TypeError, ValueError):
-            raise HTTPException(400, "score must be an integer 1-10")
-        if not 1 <= score <= 10:
-            raise HTTPException(400, "score must be 1-10")
-        critique = (s.get("critique") or "").strip()[:140]
-        e = q("SELECT id FROM entries WHERE id=? AND battle_id=?",
-              (s.get("entry_id"), bid), one=True)
-        if not e:
-            raise HTTPException(400, "unknown entry for this battle")
-        q("UPDATE entries SET judge_score=?, judge_critique=? WHERE id=?",
-          (score, critique or None, s.get("entry_id")))
-        n += 1
-    add_feed(f"the judge scored {n} entr{'y' if n == 1 else 'ies'}", "judge")
-    return {"ok": True, "scored": n}
-
-
 # ---------- presence ----------
 PRESENCE_SECS = 30  # a walker fades out after this long without a ping
 
@@ -980,112 +1359,279 @@ async def presence(request: Request, x_agent_handle: str = Header(None),
 # thread; on Vercel (no persistent processes) it runs lazily before each request.
 # Returns a list of (event_name, payload) for webhook delivery AFTER the lock
 # is released, so a slow subscriber can never stall the game loop.
-def _tick_body():
-    events = []
+def start_battle(kind="scheduled"):
     now = int(time.time())
-    b = current_battle()
-    if not b:
-        # start a new battle if the pause has elapsed
-        last = q("SELECT created_at FROM battles ORDER BY created_at DESC LIMIT 1", one=True)
-        if not last or now - last["created_at"] >= PAUSE_SECS + ENTRY_SECS + VOTE_SECS:
-            prompt, prize = secrets.choice(PROMPTS)
-            bid = "battle_" + secrets.token_urlsafe(6)
-            q("INSERT INTO battles(id,prompt,prize,phase,ends_at,created_at) VALUES(?,?,?,?,?,?)",
-              (bid, prompt, prize, "entries", now + ENTRY_SECS, now))
-            add_feed(f"battle opened \u2014 \"{prompt}\" \u00b7 prize {prize} tokens", "battle")
-            events.append(("battle.opened", {"battle_id": bid, "prompt": prompt,
-                                             "prize": prize,
-                                             "entries_deadline": now + ENTRY_SECS}))
-    elif b["ends_at"] <= now:
-        if b["phase"] == "entries":
-            n = q("SELECT COUNT(*) c FROM entries WHERE battle_id=?", (b["id"],), one=True)["c"]
-            if n == 0:
-                q("UPDATE battles SET phase='done' WHERE id=?", (b["id"],))
-                add_feed(f"battle \"{b['prompt']}\" fizzled \u2014 no entries", "battle")
-            else:
-                q("UPDATE battles SET phase='voting', ends_at=? WHERE id=?",
-                  (now + VOTE_SECS, b["id"]))
-                add_feed(f"voting open \u2014 {n} entries for \"{b['prompt']}\"", "battle")
-                entries = q("SELECT e.id, e.title, a.handle FROM entries e "
-                            "JOIN agents a ON a.id=e.agent_id WHERE e.battle_id=?",
-                            (b["id"],))
-                events.append(("battle.voting",
-                               {"battle_id": b["id"], "prompt": b["prompt"],
-                                "entries": [{"entry_id": e["id"], "handle": e["handle"],
-                                             "title": e["title"]} for e in entries]}))
-        elif b["phase"] == "voting":
-            entries = q("SELECT e.*, a.handle FROM entries e JOIN agents a ON a.id=e.agent_id "
-                        "WHERE e.battle_id=? ORDER BY e.created_at", (b["id"],))
-            crowd_total = sum(e["votes"] for e in entries)
-            judged = [e for e in entries if e["judge_score"] is not None]
-            if crowd_total > 0:
-                # judge score counts as half the vote weight
-                scored = [(e["votes"] + (e["judge_score"] or 0) * 0.5, e) for e in entries]
-                top = max(s for s, _ in scored)
-                tied = [e for s, e in scored if s == top]
-            elif judged:
-                # empty park: the judge decides alone
-                top = max(e["judge_score"] for e in judged)
-                tied = [e for e in judged if e["judge_score"] == top]
-            else:
-                tied = [e for e in entries if e["votes"] == (entries[0]["votes"] if entries else 0)]
-            w = secrets.choice(tied) if tied else None
-            if not w:
-                q("UPDATE battles SET phase='done' WHERE id=?", (b["id"],))
-                return events
-            q("UPDATE battles SET phase='done', winner_id=? WHERE id=?", (w["agent_id"], b["id"]))
-            q("UPDATE agents SET tokens=tokens+?, wins=wins+1 WHERE id=?", (b["prize"], w["agent_id"]))
-            q("INSERT INTO ledger(ts,from_id,to_id,amount,reason) VALUES(?,?,?,?,?)",
-              (now, None, w["agent_id"], b["prize"], "prize"))
-            how = ""
-            if judged and crowd_total == 0:
-                how = " \u00b7 decided by the judge"
-            elif judged:
-                how = " \u00b7 judge weighed in"
-            add_feed(f"{w['handle']} wins \"{b['prompt']}\" with {w['title']} \u00b7 +{b['prize']} tokens{how}",
-                     "win")
-            events.append(("battle.closed",
-                           {"battle_id": b["id"], "prompt": b["prompt"],
-                            "winner_handle": w["handle"], "prize": b["prize"],
-                            "decided_by": "judge" if (judged and crowd_total == 0) else "crowd",
-                            "entries": [{"handle": e["handle"], "title": e["title"],
-                                         "votes": e["votes"],
-                                         "judge_score": e["judge_score"]} for e in entries]}))
-            # achievements at close
-            ev = _award(w["agent_id"], "first_win")
+    prompt = secrets.choice(ROAST_PROMPTS)
+    bid = "battle_" + secrets.token_urlsafe(6)
+    window = EXHIBITION_OPEN_SECS if kind == "exhibition" else OPEN_SECS
+    q("INSERT INTO battles(id,prompt,prize,phase,ends_at,created_at,kind,rubric_version) "
+      "VALUES(?,?,?,?,?,?,?,?)",
+      (bid, prompt, 0, "open", now + window, now, kind, RUBRIC_VERSION))
+    add_feed(f"battle opened \u2014 \"{prompt}\"", "battle")
+    _deliver_events([("battle.opened",
+                      {"battle_id": bid, "prompt": prompt, "prize": 0,
+                       "entries_deadline": now + window})])
+    return bid
+
+
+def close_entries(bid):
+    """open -> judging (assign blind ids, seed judge runs) or -> fizzled."""
+    n = q("SELECT COUNT(*) c FROM entries WHERE battle_id=?", (bid,), one=True)["c"]
+    if n == 0:
+        q("UPDATE battles SET phase='fizzled' WHERE id=? AND phase='open'", (bid,))
+        add_feed("battle fizzled \u2014 no entries", "battle")
+        return
+    ids = [r["id"] for r in q("SELECT id FROM entries WHERE battle_id=?", (bid,))]
+    mapping = judges.assign_blind_ids(ids, seed=bid)
+    for eid, blind in mapping.items():
+        q("UPDATE entries SET blind_id=? WHERE id=?", (blind, eid))
+    ident = judges.backend_identity(judges.get_backend())
+    for i in range(JUDGE_COUNT):
+        if USE_PG:
+            q("INSERT INTO judge_runs(battle_id,judge_index,model,model_version,status) "
+              "VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING",
+              (bid, i, ident["name"], ident["version"], "pending"))
+        else:
+            q("INSERT OR IGNORE INTO judge_runs(battle_id,judge_index,model,model_version,status) "
+              "VALUES(?,?,?,?,?)",
+              (bid, i, ident["name"], ident["version"], "pending"))
+    q("UPDATE battles SET phase='judging' WHERE id=? AND phase='open'", (bid,))
+    add_feed(f"judging started \u2014 {n} blind entries", "battle")
+    b = q("SELECT prompt FROM battles WHERE id=?", (bid,), one=True)
+    _deliver_events([("battle.judging",
+                      {"battle_id": bid, "prompt": b["prompt"] if b else "",
+                       "entries": n})])
+
+
+def _claim_resolution(key, now, bid):
+    """Claim the right to resolve a battle. Exactly one worker wins.
+
+    Stale claims (older than STALE_CLAIM_SECS with no result row, i.e. the
+    claimant crashed mid-resolution) can be stolen by the next worker.
+    """
+    try:
+        q("INSERT INTO idempotency_keys(key,created_at,response) VALUES(?,?,?)",
+          (key, now, '{"status":"claimed"}'))
+        return True
+    except Exception as e:
+        if not _is_unique_violation(e):
+            raise
+    if q("SELECT battle_id FROM battle_results WHERE battle_id=?", (bid,), one=True):
+        return False
+    row = q("SELECT created_at FROM idempotency_keys WHERE key=?", (key,), one=True)
+    if row and now - row["created_at"] > STALE_CLAIM_SECS:
+        q("DELETE FROM idempotency_keys WHERE key=?", (key,))
+        try:
+            q("INSERT INTO idempotency_keys(key,created_at,response) VALUES(?,?,?)",
+              (key, now, '{"status":"claimed"}'))
+            return True
+        except Exception as e2:
+            if _is_unique_violation(e2):
+                return False
+            raise
+    return False
+
+
+def resolve_battle(bid):
+    """Resolve a judged battle exactly once. Returns True if this call won."""
+    now = int(time.time())
+    key = f"resolve:{bid}"
+    if not _claim_resolution(key, now, bid):
+        return False
+    try:
+        b = q("SELECT * FROM battles WHERE id=?", (bid,), one=True)
+        if not b or b["phase"] != "judging":
+            return False
+        if q("SELECT battle_id FROM battle_results WHERE battle_id=?", (bid,), one=True):
+            q("UPDATE battles SET phase='resolved' WHERE id=? AND phase='judging'", (bid,))
+            return False
+        scores = q("SELECT judge_index, blind_id, originality, craft, impact "
+                   "FROM judge_scores WHERE battle_id=?", (bid,))
+        per_judge = [[] for _ in range(JUDGE_COUNT)]
+        for s in scores:
+            idx = s["judge_index"]
+            if 0 <= idx < JUDGE_COUNT:
+                per_judge[idx].append({"blind_id": s["blind_id"],
+                                       "originality": s["originality"],
+                                       "craft": s["craft"],
+                                       "impact": s["impact"]})
+        if any(len(pj) == 0 for pj in per_judge):
+            return False  # not all judges actually finished; release via stale-claim path
+        agg = judges.aggregate(bid, per_judge)
+        winner_blind = agg["winner_blind_id"]
+        wentry = q("SELECT id, agent_id FROM entries WHERE battle_id=? AND blind_id=?",
+                   (bid, winner_blind), one=True)
+        if not wentry:
+            return False
+        runs = q("SELECT model, model_version FROM judge_runs WHERE battle_id=? "
+                 "ORDER BY judge_index", (bid,))
+        try:
+            q("INSERT INTO battle_results(battle_id,winner_entry_id,winner_agent_id,"
+              "median_scores,tie_break,rubric_version,judge_models,created_at) "
+              "VALUES(?,?,?,?,?,?,?,?)",
+              (bid, wentry["id"], wentry["agent_id"],
+               json.dumps(agg["by_entry"]), agg["tie_break"], RUBRIC_VERSION,
+               json.dumps([{"name": r["model"], "version": r["model_version"]}
+                           for r in runs]), now))
+        except Exception as e:
+            if _is_unique_violation(e):
+                return False
+            raise
+        q("UPDATE battles SET phase='resolved', winner_id=?, resolved_at=?, "
+          "resolution_key=? WHERE id=?",
+          (wentry["agent_id"], now, key, bid))
+        # Phase 1 (spec v0.3): wins and rankings only. No token minting.
+        q("UPDATE agents SET wins=wins+1 WHERE id=?", (wentry["agent_id"],))
+        w = q("SELECT handle FROM agents WHERE id=?", (wentry["agent_id"],), one=True)
+        add_feed(f"{w['handle']} wins the battle \u2014 judges have spoken", "win")
+        # park extras: win streak, achievements, webhook
+        wrow = q("SELECT win_streak FROM agents WHERE id=?", (wentry["agent_id"],), one=True)
+        streak = (wrow["win_streak"] or 0) + 1 if wrow else 1
+        q("UPDATE agents SET win_streak=? WHERE id=?", (streak, wentry["agent_id"]))
+        for e in q("SELECT agent_id FROM entries WHERE battle_id=?", (bid,)):
+            if e["agent_id"] != wentry["agent_id"]:
+                q("UPDATE agents SET win_streak=0 WHERE id=?", (e["agent_id"]))
+        events = []
+        ev = _award(wentry["agent_id"], "first_win")
+        if ev:
+            events.append(ev)
+        if streak >= 3:
+            ev = _award(wentry["agent_id"], "streak_3")
             if ev:
                 events.append(ev)
-            wrow = q("SELECT win_streak FROM agents WHERE id=?", (w["agent_id"],), one=True)
-            streak = (wrow["win_streak"] or 0) + 1
-            q("UPDATE agents SET win_streak=? WHERE id=?", (streak, w["agent_id"]))
-            if streak >= 3:
-                ev = _award(w["agent_id"], "streak_3")
-                if ev:
-                    events.append(ev)
-            for e in entries:
-                if e["agent_id"] != w["agent_id"]:
-                    q("UPDATE agents SET win_streak=0 WHERE id=?", (e["agent_id"],))
-            if entries:
-                top_votes = max(e["votes"] for e in entries)
-                if top_votes > 0:
-                    for e in entries:
-                        if e["votes"] == top_votes:
-                            ev = _award(e["agent_id"], "crowd_favorite")
-                            if ev:
-                                events.append(ev)
-            for e in entries:
-                erow = q("SELECT battles FROM agents WHERE id=?", (e["agent_id"],), one=True)
-                if erow and erow["battles"] >= 10:
-                    ev = _award(e["agent_id"], "regular_10")
-                    if ev:
-                        events.append(ev)
-    return events
+        entries = q("SELECT e.id, e.title, a.handle FROM entries e "
+                    "JOIN agents a ON a.id=e.agent_id WHERE e.battle_id=?", (bid,))
+        events.append(("battle.closed",
+                       {"battle_id": bid, "prompt": b["prompt"],
+                        "winner_handle": w["handle"], "prize": 0,
+                        "decided_by": "judges",
+                        "entries": [{"handle": e["handle"], "title": e["title"]} for e in entries]}))
+        _deliver_events(events)
+        return True
+    except Exception:
+        # Leave the claim in place; a later tick steals it after STALE_CLAIM_SECS.
+        raise
+
+
+def advance_judging(bid):
+    """Run pending judge evaluations (concurrently), then resolve if complete."""
+    b = q("SELECT * FROM battles WHERE id=?", (bid,), one=True)
+    if not b or b["phase"] != "judging":
+        return
+    runs = q("SELECT * FROM judge_runs WHERE battle_id=? ORDER BY judge_index", (bid,))
+    done = sum(1 for r in runs if r["status"] == "completed")
+    if done >= JUDGE_COUNT:
+        resolve_battle(bid)
+        return
+    now = int(time.time())
+    pending = []
+    for r in runs:
+        if r["status"] == "completed" or r["attempts"] >= JUDGE_MAX_ATTEMPTS:
+            continue
+        if r["status"] == "running":
+            # another worker owns it; steal only if it looks crashed
+            started = r["started_at"] or 0
+            if now - started < STALE_CLAIM_SECS:
+                continue
+        pending.append(r)
+    if not pending:
+        fresh_running = any(r["status"] == "running"
+                            and now - (r["started_at"] or 0) < STALE_CLAIM_SECS
+                            for r in runs)
+        if fresh_running:
+            return  # another worker is actively judging; leave it alone
+        once = f"degraded:{bid}"
+        if idem_get(once) is None:
+            idem_put(once, {"ok": True})
+            add_feed(f"judging degraded on battle {bid[:14]} \u2014 judges exhausted retries",
+                     "warn")
+        return
+    entries = q("SELECT blind_id, body FROM entries "
+                "WHERE battle_id=? AND blind_id IS NOT NULL ORDER BY blind_id", (bid,))
+    if not entries:
+        return
+    payload = [{"blind_id": e["blind_id"], "body": e["body"]} for e in entries]
+    backend = judges.get_backend()
+
+    def do_judge(run):
+        idx = run["judge_index"]
+        q("UPDATE judge_runs SET status='running', attempts=attempts+1, started_at=?, "
+          "error=NULL WHERE battle_id=? AND judge_index=?",
+          (int(time.time()), bid, idx))
+        try:
+            scores = backend.evaluate(b["prompt"], payload)
+            for s in scores:
+                if USE_PG:
+                    q("INSERT INTO judge_scores(battle_id,judge_index,blind_id,originality,"
+                      "craft,impact,rationale,created_at) VALUES(?,?,?,?,?,?,?,?) "
+                      "ON CONFLICT DO NOTHING",
+                      (bid, idx, s["blind_id"], s["originality"], s["craft"],
+                       s["impact"], s["rationale"], int(time.time())))
+                else:
+                    q("INSERT OR IGNORE INTO judge_scores(battle_id,judge_index,blind_id,"
+                      "originality,craft,impact,rationale,created_at) "
+                      "VALUES(?,?,?,?,?,?,?,?)",
+                      (bid, idx, s["blind_id"], s["originality"], s["craft"],
+                       s["impact"], s["rationale"], int(time.time())))
+            q("UPDATE judge_runs SET status='completed', completed_at=? "
+              "WHERE battle_id=? AND judge_index=?",
+              (int(time.time()), bid, idx))
+            return True
+        except Exception as e:
+            q("UPDATE judge_runs SET status='failed', error=? "
+              "WHERE battle_id=? AND judge_index=?",
+              (str(e)[:500], bid, idx))
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=JUDGE_COUNT) as ex:
+        list(ex.map(do_judge, pending))
+    done = q("SELECT COUNT(*) c FROM judge_runs WHERE battle_id=? AND status='completed'",
+             (bid,), one=True)["c"]
+    if done >= JUDGE_COUNT:
+        resolve_battle(bid)
+
+
+def _tick_transitions():
+    """Fast, lock-held state transitions: close elapsed battles, start new ones."""
+    now = int(time.time())
+    # 1. close any open battle whose window has elapsed
+    b = q("SELECT * FROM battles WHERE phase='open' AND ends_at<=? "
+          "ORDER BY created_at DESC LIMIT 1", (now,), one=True)
+    if b:
+        close_entries(b["id"])
+    # 2. start a new scheduled battle if nothing is live and the pause elapsed
+    live = q("SELECT id FROM battles WHERE phase IN ('open','judging') AND kind='scheduled' LIMIT 1", one=True)
+    if not live:
+        last = q("SELECT COALESCE(resolved_at, created_at) t FROM battles "
+                 "ORDER BY created_at DESC LIMIT 1", one=True)
+        if not last or now - last["t"] >= PAUSE_SECS:
+            start_battle(kind="scheduled")
+
+
+def _tick_judging():
+    """Slow judge execution. Runs OUTSIDE the tick lock (judges take seconds);
+    exactly-once resolution is enforced by the resolve claim, not the lock."""
+    b = q("SELECT * FROM battles WHERE phase='judging' "
+          "ORDER BY created_at DESC LIMIT 1", one=True)
+    if b:
+        advance_judging(b["id"])
+
+
+def _tick_body():
+    _tick_transitions()
+    _tick_judging()
 
 
 def tick_once():
     """Run one game-loop iteration, serialized across concurrent invocations.
-    Webhook events are delivered after the lock is released."""
-    events = []
+
+    Fast transitions run under the lock (db_lock locally, a PG advisory lock
+    on Vercel). Judge execution runs after the lock is released: judges take
+    seconds, and holding the lock would wedge every request (SQLite) or
+    serialize all serverless invocations (PG). Correctness of judging and
+    resolution comes from the judge_runs state machine and the exactly-once
+    resolve claim, not from the tick lock.
+    """
     try:
         if USE_PG:
             # Advisory lock so concurrent serverless invocations don't double-start battles.
@@ -1093,18 +1639,17 @@ def tick_once():
             try:
                 con.execute("SELECT pg_advisory_lock(424242)")
                 try:
-                    events = _tick_body()
+                    _tick_transitions()
                 finally:
                     con.execute("SELECT pg_advisory_unlock(424242)")
             finally:
                 con.close()
         else:
             with db_lock:
-                events = _tick_body()
+                _tick_transitions()
+        _tick_judging()
     except Exception as exc:  # never break a request because of the tick
         print("tick error:", exc)
-        return
-    _deliver_events(events)
 
 
 def scheduler_loop():
